@@ -29,13 +29,12 @@ MAX_TRADES_PER_SYMBOL = 2
 RSI_PERIOD = 14
 CHECK_INTERVAL = 30
 
-stats = {
-    "total_trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "total_pnl": 0.0
-}
+# 🔥 NEW CONTROL
+last_report = None
+last_report_time = 0
+MESSAGE_COOLDOWN = 60
 
+stats = {"total_trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
 active_positions = {}
 
 def log(msg):
@@ -43,9 +42,14 @@ def log(msg):
     print(f"[{now}] {msg}")
 
 async def send_telegram(session, msg):
+    global last_report_time
     try:
+        now = time.time()
+        if now - last_report_time < MESSAGE_COOLDOWN:
+            return
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         await session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        last_report_time = now
     except Exception as e:
         log(f"Telegram error: {e}")
 
@@ -53,11 +57,7 @@ def get_okx_headers(method, path, body=""):
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     message = timestamp + method.upper() + path + body
     signature = base64.b64encode(
-        hmac.new(
-            OKX_SECRET.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).digest()
+        hmac.new(OKX_SECRET.encode(), message.encode(), hashlib.sha256).digest()
     ).decode()
     return {
         "OK-ACCESS-KEY": OKX_API_KEY,
@@ -72,11 +72,9 @@ async def get_candles(session, symbol, bar="1m", limit=50):
         path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
         async with session.get(OKX_BASE + path) as r:
             data = await r.json()
-            candles = data.get("data", [])
-            closes = [float(c[4]) for c in reversed(candles)]
+            closes = [float(c[4]) for c in reversed(data.get("data", []))]
             return closes
-    except Exception as e:
-        log(f"Candles error: {e}")
+    except:
         return []
 
 async def get_current_price(session, symbol):
@@ -84,24 +82,18 @@ async def get_current_price(session, symbol):
         path = f"/api/v5/market/ticker?instId={symbol}"
         async with session.get(OKX_BASE + path) as r:
             data = await r.json()
-            ticker = data.get("data", [{}])[0]
-            return float(ticker.get("last", 0))
+            return float(data.get("data", [{}])[0].get("last", 0))
     except:
         return 0.0
 
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
@@ -124,54 +116,15 @@ def get_signal(closes):
     rsi = calculate_rsi(closes, RSI_PERIOD)
     ema_fast = calculate_ema(closes, 9)
     ema_slow = calculate_ema(closes, 21)
-    current_price = closes[-1]
-    if rsi < 35 and ema_fast > ema_slow and current_price > ema_fast:
+    price = closes[-1]
+    if rsi < 35 and ema_fast > ema_slow and price > ema_fast:
         return "LONG"
-    elif rsi > 65 and ema_fast < ema_slow and current_price < ema_fast:
+    elif rsi > 65 and ema_fast < ema_slow and price < ema_fast:
         return "SHORT"
     return "WAIT"
 
-async def place_order(session, symbol, side, size):
-    if DRY_RUN:
-        price = await get_current_price(session, symbol)
-        log(f"[SIMULATION] {side} {symbol} @ ${price:.2f}")
-        return {"ordId": f"sim_{int(time.time())}", "price": price}
-    try:
-        path = "/api/v5/trade/order"
-        body = json.dumps({
-            "instId": symbol,
-            "tdMode": "cross",
-            "side": side.lower(),
-            "ordType": "market",
-            "sz": str(size),
-            "posSide": "long" if side == "BUY" else "short"
-        })
-        headers = get_okx_headers("POST", path, body)
-        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
-            data = await r.json()
-            return data.get("data", [{}])[0]
-    except Exception as e:
-        log(f"Order error: {e}")
-        return None
-
-async def set_leverage(session, symbol):
-    if DRY_RUN:
-        return
-    try:
-        path = "/api/v5/account/set-leverage"
-        body = json.dumps({
-            "instId": symbol,
-            "lever": str(LEVERAGE),
-            "mgnMode": "cross"
-        })
-        headers = get_okx_headers("POST", path, body)
-        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
-            await r.json()
-    except Exception as e:
-        log(f"Leverage error: {e}")
-
 async def scalp_symbol(session, symbol):
-    symbol_positions = {k: v for k, v in active_positions.items() if symbol in k}
+    symbol_positions = [k for k in active_positions if symbol in k]
     if len(symbol_positions) >= MAX_TRADES_PER_SYMBOL:
         return
 
@@ -183,169 +136,88 @@ async def scalp_symbol(session, symbol):
     if signal == "WAIT":
         return
 
-    current_price = closes[-1]
-    rsi = calculate_rsi(closes, RSI_PERIOD)
-    ema_fast = calculate_ema(closes, 9)
-    ema_slow = calculate_ema(closes, 21)
+    price = closes[-1]
 
-    if signal == "LONG":
-        tp_price = current_price * (1 + TAKE_PROFIT_PCT)
-        sl_price = current_price * (1 - STOP_LOSS_PCT)
-        side = "BUY"
-    else:
-        tp_price = current_price * (1 - TAKE_PROFIT_PCT)
-        sl_price = current_price * (1 + STOP_LOSS_PCT)
-        side = "SELL"
-
-    size = round((MARGIN_PER_TRADE * LEVERAGE) / current_price, 4)
-
-    await set_leverage(session, symbol)
-    result = await place_order(session, symbol, side, size)
-    if not result:
-        return
+    tp = price * (1 + TAKE_PROFIT_PCT) if signal == "LONG" else price * (1 - TAKE_PROFIT_PCT)
+    sl = price * (1 - STOP_LOSS_PCT) if signal == "LONG" else price * (1 + STOP_LOSS_PCT)
 
     trade_id = f"{symbol}_{int(time.time())}"
+
     active_positions[trade_id] = {
         "symbol": symbol,
         "side": signal,
-        "entry_price": current_price,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "size": size,
-        "entry_time": time.time(),
+        "entry_price": price,
+        "tp_price": tp,
+        "sl_price": sl,
         "margin": MARGIN_PER_TRADE,
         "closed": False
     }
 
     stats["total_trades"] += 1
 
-    msg = (
-        f"⚡ SCALP TRADE!\n"
-        f"📊 {symbol}\n"
-        f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
-        f"💲 Bei: ${current_price:.2f}\n"
-        f"🎯 TP: ${tp_price:.2f}\n"
-        f"🛑 SL: ${sl_price:.2f}\n"
-        f"📈 RSI: {rsi:.1f}\n"
-        f"📊 EMA9: ${ema_fast:.2f} | EMA21: ${ema_slow:.2f}\n"
-        f"💰 Margin: ${MARGIN_PER_TRADE} x {LEVERAGE}\n"
-        f"🔢 Trade #{stats['total_trades']}\n"
-        f"🧪 SIMULATION"
-    )
+    msg = f"⚡ TRADE {signal}\n📊 {symbol}\n💲 {price:.2f}\nTP {tp:.2f} | SL {sl:.2f}"
     log(msg)
     await send_telegram(session, msg)
 
 async def monitor_positions(session):
     while True:
-        try:
-            closed_ids = []
-            for trade_id, pos in list(active_positions.items()):
-                if pos["closed"]:
-                    closed_ids.append(trade_id)
-                    continue
+        for trade_id, pos in list(active_positions.items()):
+            price = await get_current_price(session, pos["symbol"])
+            if not price:
+                continue
 
-                current_price = await get_current_price(session, pos["symbol"])
-                if current_price == 0:
-                    continue
+            tp_hit = price >= pos["tp_price"] if pos["side"] == "LONG" else price <= pos["tp_price"]
+            sl_hit = price <= pos["sl_price"] if pos["side"] == "LONG" else price >= pos["sl_price"]
 
-                if pos["side"] == "LONG":
-                    pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+            if tp_hit or sl_hit:
+                pnl = (price - pos["entry_price"]) if pos["side"] == "LONG" else (pos["entry_price"] - price)
+                pnl *= LEVERAGE
+
+                if tp_hit:
+                    stats["wins"] += 1
                 else:
-                    pnl_pct = (pos["entry_price"] - current_price) / pos["entry_price"]
+                    stats["losses"] += 1
 
-                pnl_usd = pnl_pct * pos["margin"] * LEVERAGE
+                stats["total_pnl"] += pnl
 
-                tp_hit = (pos["side"] == "LONG" and current_price >= pos["tp_price"]) or \
-                         (pos["side"] == "SHORT" and current_price <= pos["tp_price"])
-                sl_hit = (pos["side"] == "LONG" and current_price <= pos["sl_price"]) or \
-                         (pos["side"] == "SHORT" and current_price >= pos["sl_price"])
+                msg = f"📉 CLOSE {pos['symbol']} @ {price:.2f}\nPnL {pnl:.2f}"
+                await send_telegram(session, msg)
 
-                if tp_hit or sl_hit:
-                    pos["closed"] = True
-                    closed_ids.append(trade_id)
-                    if tp_hit:
-                        stats["wins"] += 1
-                        stats["total_pnl"] += pnl_usd
-                        result_emoji = "💰 TAKE PROFIT!"
-                    else:
-                        stats["losses"] += 1
-                        stats["total_pnl"] += pnl_usd
-                        result_emoji = "🛑 STOP LOSS!"
+                del active_positions[trade_id]
 
-                    win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
-                    msg = (
-                        f"{result_emoji}\n"
-                        f"📊 {pos['symbol']}\n"
-                        f"{'🟢 LONG' if pos['side'] == 'LONG' else '🔴 SHORT'}\n"
-                        f"💲 Entry: ${pos['entry_price']:.2f}\n"
-                        f"💲 Exit: ${current_price:.2f}\n"
-                        f"💵 PnL: {'+' if pnl_usd > 0 else ''}{pnl_usd:.2f} USDT\n"
-                        f"📊 Total PnL: ${stats['total_pnl']:.2f}\n"
-                        f"🏆 Win Rate: {win_rate:.1f}%\n"
-                        f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
-                        f"🧪 SIMULATION"
-                    )
-                    log(msg)
-                    await send_telegram(session, msg)
-
-            for trade_id in closed_ids:
-                if trade_id in active_positions:
-                    del active_positions[trade_id]
-
-            await asyncio.sleep(5)
-
-        except Exception as e:
-            log(f"Monitor error: {e}")
-            await asyncio.sleep(5)
-
-async def run_dual_scalper(session):
-    while True:
-        try:
-            await scalp_symbol(session, SYMBOL_1)
-            await asyncio.sleep(2)
-            await scalp_symbol(session, SYMBOL_2)
-            await asyncio.sleep(CHECK_INTERVAL)
-        except Exception as e:
-            log(f"Scalper error: {e}")
-            await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
 async def print_stats(session):
+    global last_report
     while True:
         await asyncio.sleep(300)
+
         win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
-        msg = (
-            f"📊 RIPOTI YA DAKIKA 5\n"
-            f"⚡ Trades: {stats['total_trades']}\n"
-            f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
-            f"🏆 Win Rate: {win_rate:.1f}%\n"
-            f"💰 Total PnL: ${stats['total_pnl']:.2f} USDT\n"
-            f"🔢 Leverage: {LEVERAGE}x\n"
-            f"🧪 SIMULATION"
-        )
-        log(msg)
+
+        msg = f"📊 Trades {stats['total_trades']} | Wins {stats['wins']} | Loss {stats['losses']} | PnL {stats['total_pnl']:.2f}"
+
+        if msg == last_report:
+            continue
+
+        last_report = msg
         await send_telegram(session, msg)
 
 async def main():
     async with aiohttp.ClientSession() as session:
-        start_msg = (
-            f"⚡ OKX DUAL FUTURES SCALPING BOT!\n"
-            f"📊 BTC-USDT-SWAP\n"
-            f"📊 ETH-USDT-SWAP\n"
-            f"🔢 Leverage: {LEVERAGE}x\n"
-            f"💰 Margin/Trade: ${MARGIN_PER_TRADE}\n"
-            f"🎯 Take Profit: {TAKE_PROFIT_PCT*100:.1f}%\n"
-            f"🛑 Stop Loss: {STOP_LOSS_PCT*100:.1f}%\n"
-            f"📈 Indicators: RSI + EMA Cross\n"
-            f"🧪 Mode: {'SIMULATION' if DRY_RUN else 'LIVE'}"
-        )
-        log(start_msg)
-        await send_telegram(session, start_msg)
+        await send_telegram(session, "🚀 BOT STARTED")
 
         await asyncio.gather(
             run_dual_scalper(session),
             monitor_positions(session),
             print_stats(session)
         )
+
+async def run_dual_scalper(session):
+    while True:
+        await scalp_symbol(session, SYMBOL_1)
+        await asyncio.sleep(2)
+        await scalp_symbol(session, SYMBOL_2)
+        await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
