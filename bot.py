@@ -11,7 +11,7 @@ OKX_API_KEY = "a0457663-9fdc-4787-b27e-5b7b7f34e99b"
 OKX_SECRET = "B803CF81AB7DCFD262399F893D755497"
 OKX_PASSPHRASE = "Futuresbot2026."
 
-TELEGRAM_TOKEN = "8778061073:AAFvbdcKusf3P74VLTzdcYa7obV2LrgDXyE"
+TELEGRAM_TOKEN = "8787267026:AAHjMfzdg9JwVxdCo6pnoiNq2o1xvU2pC30"
 TELEGRAM_CHAT_ID = "7010983039"
 
 OKX_BASE = "https://www.okx.com"
@@ -92,10 +92,8 @@ async def get_current_price(session, symbol):
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-
     gains = []
     losses = []
-
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
         if diff > 0:
@@ -104,52 +102,40 @@ def calculate_rsi(closes, period=14):
         else:
             gains.append(0)
             losses.append(abs(diff))
-
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-
     if avg_loss == 0:
         return 100
-
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def calculate_ema(closes, period):
     if len(closes) < period:
         return closes[-1] if closes else 0
-
     multiplier = 2 / (period + 1)
     ema = sum(closes[:period]) / period
-
     for price in closes[period:]:
         ema = (price - ema) * multiplier + ema
-
     return ema
 
 def get_signal(closes):
     if len(closes) < 20:
         return "WAIT"
-
     rsi = calculate_rsi(closes, RSI_PERIOD)
     ema_fast = calculate_ema(closes, 9)
     ema_slow = calculate_ema(closes, 21)
     current_price = closes[-1]
-
     if rsi < 35 and ema_fast > ema_slow and current_price > ema_fast:
         return "LONG"
-
     elif rsi > 65 and ema_fast < ema_slow and current_price < ema_fast:
         return "SHORT"
-
     return "WAIT"
 
 async def place_order(session, symbol, side, size):
     if DRY_RUN:
         price = await get_current_price(session, symbol)
-        log(f"[SIMULATION] {side} {symbol} @ ${price:.2f} | Size: {size}")
+        log(f"[SIMULATION] {side} {symbol} @ ${price:.2f}")
         return {"ordId": f"sim_{int(time.time())}", "price": price}
-
     try:
         path = "/api/v5/trade/order"
         body = json.dumps({
@@ -171,7 +157,6 @@ async def place_order(session, symbol, side, size):
 async def set_leverage(session, symbol):
     if DRY_RUN:
         return
-
     try:
         path = "/api/v5/account/set-leverage"
         body = json.dumps({
@@ -186,7 +171,7 @@ async def set_leverage(session, symbol):
         log(f"Leverage error: {e}")
 
 async def scalp_symbol(session, symbol):
-    symbol_positions = {k: v for k, v in active_positions.items() if k.startswith(symbol)}
+    symbol_positions = {k: v for k, v in active_positions.items() if symbol in k}
     if len(symbol_positions) >= MAX_TRADES_PER_SYMBOL:
         return
 
@@ -216,7 +201,6 @@ async def scalp_symbol(session, symbol):
 
     await set_leverage(session, symbol)
     result = await place_order(session, symbol, side, size)
-
     if not result:
         return
 
@@ -236,15 +220,15 @@ async def scalp_symbol(session, symbol):
     stats["total_trades"] += 1
 
     msg = (
-        f"⚡ SCALP TRADE IMEFUNGULIWA!\n"
-        f"📊 Symbol: {symbol}\n"
+        f"⚡ SCALP TRADE!\n"
+        f"📊 {symbol}\n"
         f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
         f"💲 Bei: ${current_price:.2f}\n"
-        f"🎯 Take Profit: ${tp_price:.2f}\n"
-        f"🛑 Stop Loss: ${sl_price:.2f}\n"
+        f"🎯 TP: ${tp_price:.2f}\n"
+        f"🛑 SL: ${sl_price:.2f}\n"
         f"📈 RSI: {rsi:.1f}\n"
         f"📊 EMA9: ${ema_fast:.2f} | EMA21: ${ema_slow:.2f}\n"
-        f"💰 Margin: ${MARGIN_PER_TRADE} | Leverage: {LEVERAGE}x\n"
+        f"💰 Margin: ${MARGIN_PER_TRADE} x {LEVERAGE}\n"
         f"🔢 Trade #{stats['total_trades']}\n"
         f"🧪 SIMULATION"
     )
@@ -255,8 +239,7 @@ async def monitor_positions(session):
     while True:
         try:
             closed_ids = []
-
-            for trade_id, pos in active_positions.items():
+            for trade_id, pos in list(active_positions.items()):
                 if pos["closed"]:
                     closed_ids.append(trade_id)
                     continue
@@ -274,14 +257,12 @@ async def monitor_positions(session):
 
                 tp_hit = (pos["side"] == "LONG" and current_price >= pos["tp_price"]) or \
                          (pos["side"] == "SHORT" and current_price <= pos["tp_price"])
-
                 sl_hit = (pos["side"] == "LONG" and current_price <= pos["sl_price"]) or \
                          (pos["side"] == "SHORT" and current_price >= pos["sl_price"])
 
                 if tp_hit or sl_hit:
                     pos["closed"] = True
                     closed_ids.append(trade_id)
-
                     if tp_hit:
                         stats["wins"] += 1
                         stats["total_pnl"] += pnl_usd
@@ -292,14 +273,13 @@ async def monitor_positions(session):
                         result_emoji = "🛑 STOP LOSS!"
 
                     win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
-
                     msg = (
                         f"{result_emoji}\n"
                         f"📊 {pos['symbol']}\n"
                         f"{'🟢 LONG' if pos['side'] == 'LONG' else '🔴 SHORT'}\n"
                         f"💲 Entry: ${pos['entry_price']:.2f}\n"
                         f"💲 Exit: ${current_price:.2f}\n"
-                        f"📈 PnL: {'+' if pnl_usd > 0 else ''}{pnl_usd:.2f} USDT\n"
+                        f"💵 PnL: {'+' if pnl_usd > 0 else ''}{pnl_usd:.2f} USDT\n"
                         f"📊 Total PnL: ${stats['total_pnl']:.2f}\n"
                         f"🏆 Win Rate: {win_rate:.1f}%\n"
                         f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
@@ -319,15 +299,12 @@ async def monitor_positions(session):
             await asyncio.sleep(5)
 
 async def run_dual_scalper(session):
-    log("Dual Futures Scalper inaanza...")
-
     while True:
         try:
             await scalp_symbol(session, SYMBOL_1)
             await asyncio.sleep(2)
             await scalp_symbol(session, SYMBOL_2)
             await asyncio.sleep(CHECK_INTERVAL)
-
         except Exception as e:
             log(f"Scalper error: {e}")
             await asyncio.sleep(10)
@@ -342,8 +319,6 @@ async def print_stats(session):
             f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
             f"🏆 Win Rate: {win_rate:.1f}%\n"
             f"💰 Total PnL: ${stats['total_pnl']:.2f} USDT\n"
-            f"📊 BTC: {SYMBOL_1}\n"
-            f"📊 ETH: {SYMBOL_2}\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
             f"🧪 SIMULATION"
         )
@@ -354,8 +329,8 @@ async def main():
     async with aiohttp.ClientSession() as session:
         start_msg = (
             f"⚡ OKX DUAL FUTURES SCALPING BOT!\n"
-            f"📊 Symbol 1: {SYMBOL_1}\n"
-            f"📊 Symbol 2: {SYMBOL_2}\n"
+            f"📊 BTC-USDT-SWAP\n"
+            f"📊 ETH-USDT-SWAP\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
             f"💰 Margin/Trade: ${MARGIN_PER_TRADE}\n"
             f"🎯 Take Profit: {TAKE_PROFIT_PCT*100:.1f}%\n"
