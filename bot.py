@@ -24,19 +24,15 @@ SYMBOL_2 = "ETH-USDT-SWAP"
 TIMEFRAME = "5m"
 LEVERAGE = 10
 MARGIN_PER_TRADE = 5
-TAKE_PROFIT_PCT = 0.012
-STOP_LOSS_PCT = 0.006
-MAX_TRADES_PER_SYMBOL = 1
+TAKE_PROFIT_PCT = 0.02
+STOP_LOSS_PCT = 0.01
+MAX_HOLD_MINUTES = 30
 CHECK_INTERVAL = 60
 
 RSI_PERIOD = 14
-RSI_OVERSOLD = 35
-RSI_OVERBOUGHT = 65
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
 BB_PERIOD = 20
-BB_STD = 2.0
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
 
 stats = {
     "total_trades": 0,
@@ -82,16 +78,13 @@ async def get_candles(session, symbol, bar="5m", limit=100):
         path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
         async with session.get(OKX_BASE + path) as r:
             data = await r.json()
-            candles = data.get("data", [])
-            candles = list(reversed(candles))
+            candles = list(reversed(data.get("data", [])))
             closes = [float(c[4]) for c in candles]
-            highs = [float(c[2]) for c in candles]
-            lows = [float(c[3]) for c in candles]
             volumes = [float(c[5]) for c in candles]
-            return closes, highs, lows, volumes
+            return closes, volumes
     except Exception as e:
         log(f"Candles error: {e}")
-        return [], [], [], []
+        return [], []
 
 async def get_current_price(session, symbol):
     try:
@@ -115,8 +108,7 @@ def calculate_rsi(closes, period=14):
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
         return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
 def calculate_ema(closes, period):
     if len(closes) < period:
@@ -128,183 +120,99 @@ def calculate_ema(closes, period):
     return ema
 
 def calculate_macd(closes):
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
-        return 0, 0, 0
-    ema_fast = calculate_ema(closes, MACD_FAST)
-    ema_slow = calculate_ema(closes, MACD_SLOW)
-    macd_line = ema_fast - ema_slow
+    if len(closes) < 35:
+        return 0, 0
+    ema12 = calculate_ema(closes, 12)
+    ema26 = calculate_ema(closes, 26)
+    macd = ema12 - ema26
 
-    macd_values = []
-    for i in range(MACD_SIGNAL, len(closes)):
-        ef = calculate_ema(closes[:i], MACD_FAST)
-        es = calculate_ema(closes[:i], MACD_SLOW)
-        macd_values.append(ef - es)
+    macd_history = []
+    for i in range(26, len(closes)):
+        e12 = calculate_ema(closes[:i], 12)
+        e26 = calculate_ema(closes[:i], 26)
+        macd_history.append(e12 - e26)
 
-    if len(macd_values) < MACD_SIGNAL:
-        return macd_line, 0, macd_line
+    if len(macd_history) < 9:
+        return macd, 0
 
-    signal_line = calculate_ema(macd_values, MACD_SIGNAL)
-    histogram = macd_line - signal_line
+    signal = calculate_ema(macd_history, 9)
+    return macd, signal
 
-    prev_macd = macd_values[-2] if len(macd_values) >= 2 else macd_line
-    prev_signal = calculate_ema(macd_values[:-1], MACD_SIGNAL) if len(macd_values) > MACD_SIGNAL else signal_line
-
-    return macd_line, signal_line, histogram
-
-def calculate_bollinger_bands(closes, period=20, std_dev=2.0):
+def calculate_bollinger(closes, period=20):
     if len(closes) < period:
-        price = closes[-1] if closes else 0
-        return price, price, price
+        p = closes[-1] if closes else 0
+        return p, p, p
     recent = closes[-period:]
-    middle = sum(recent) / period
-    variance = sum((x - middle) ** 2 for x in recent) / period
-    std = variance ** 0.5
-    upper = middle + std_dev * std
-    lower = middle - std_dev * std
-    return upper, middle, lower
+    mid = sum(recent) / period
+    std = (sum((x - mid) ** 2 for x in recent) / period) ** 0.5
+    return mid + 2 * std, mid, mid - 2 * std
 
 def calculate_volume_trend(volumes):
     if len(volumes) < 10:
         return False
-    recent_vol = sum(volumes[-5:]) / 5
-    prev_vol = sum(volumes[-10:-5]) / 5
-    return recent_vol > prev_vol * 1.2
+    return sum(volumes[-5:]) / 5 > sum(volumes[-10:-5]) / 5 * 1.1
 
-def get_signal(closes, highs, lows, volumes):
+def analyze_market(closes, volumes):
     if len(closes) < 50:
         return "WAIT", {}
 
     rsi = calculate_rsi(closes, RSI_PERIOD)
-    macd_line, signal_line, histogram = calculate_macd(closes)
-    bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes, BB_PERIOD, BB_STD)
-    vol_increasing = calculate_volume_trend(volumes)
-    current_price = closes[-1]
+    macd, macd_signal = calculate_macd(closes)
+    bb_upper, bb_mid, bb_lower = calculate_bollinger(closes, BB_PERIOD)
+    vol_up = calculate_volume_trend(volumes)
+    price = closes[-1]
 
-    prev_macd_values = []
-    for i in range(MACD_SIGNAL + 1, len(closes)):
-        ef = calculate_ema(closes[:i], MACD_FAST)
-        es = calculate_ema(closes[:i], MACD_SLOW)
-        prev_macd_values.append(ef - es)
+    long_score = sum([
+        rsi < RSI_OVERSOLD,
+        macd > macd_signal,
+        price < bb_lower * 1.002,
+        vol_up
+    ])
 
-    macd_crossed_up = False
-    macd_crossed_down = False
+    short_score = sum([
+        rsi > RSI_OVERBOUGHT,
+        macd < macd_signal,
+        price > bb_upper * 0.998,
+        vol_up
+    ])
 
-    if len(prev_macd_values) >= MACD_SIGNAL + 1:
-        prev_macd = prev_macd_values[-2]
-        prev_signal = calculate_ema(prev_macd_values[:-1], MACD_SIGNAL)
-        curr_signal = calculate_ema(prev_macd_values, MACD_SIGNAL)
-        macd_crossed_up = prev_macd < prev_signal and macd_line > signal_line
-        macd_crossed_down = prev_macd > prev_signal and macd_line < signal_line
-
-    indicators = {
+    info = {
         "rsi": rsi,
-        "macd": macd_line,
-        "signal": signal_line,
-        "histogram": histogram,
+        "macd": macd,
+        "macd_signal": macd_signal,
         "bb_upper": bb_upper,
-        "bb_middle": bb_middle,
         "bb_lower": bb_lower,
-        "price": current_price,
-        "vol_increasing": vol_increasing,
-        "macd_crossed_up": macd_crossed_up,
-        "macd_crossed_down": macd_crossed_down
+        "price": price,
+        "vol_up": vol_up,
+        "long_score": long_score,
+        "short_score": short_score
     }
 
-    long_conditions = [
-        rsi < RSI_OVERSOLD,
-        macd_line > signal_line or macd_crossed_up,
-        current_price <= bb_lower * 1.005,
-        vol_increasing
-    ]
-
-    short_conditions = [
-        rsi > RSI_OVERBOUGHT,
-        macd_line < signal_line or macd_crossed_down,
-        current_price >= bb_upper * 0.995,
-        vol_increasing
-    ]
-
-    long_score = sum(long_conditions)
-    short_score = sum(short_conditions)
-
-    indicators["long_score"] = long_score
-    indicators["short_score"] = short_score
-
     if long_score >= 3:
-        return "LONG", indicators
+        return "LONG", info
     elif short_score >= 3:
-        return "SHORT", indicators
+        return "SHORT", info
+    return "WAIT", info
 
-    return "WAIT", indicators
-
-async def place_order(session, symbol, side, size):
-    if DRY_RUN:
-        price = await get_current_price(session, symbol)
-        return {"ordId": f"sim_{int(time.time())}", "price": price}
-    try:
-        path = "/api/v5/trade/order"
-        body = json.dumps({
-            "instId": symbol,
-            "tdMode": "cross",
-            "side": side.lower(),
-            "ordType": "market",
-            "sz": str(size),
-            "posSide": "long" if side == "BUY" else "short"
-        })
-        headers = get_okx_headers("POST", path, body)
-        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
-            data = await r.json()
-            return data.get("data", [{}])[0]
-    except Exception as e:
-        log(f"Order error: {e}")
-        return None
-
-async def scalp_symbol(session, symbol):
-    symbol_positions = {k: v for k, v in active_positions.items()
-                        if symbol in k and not v["closed"]}
-    if len(symbol_positions) >= MAX_TRADES_PER_SYMBOL:
-        return
-
-    closes, highs, lows, volumes = await get_candles(session, symbol, TIMEFRAME)
-    if not closes:
-        return
-
-    signal, indicators = get_signal(closes, highs, lows, volumes)
-
-    if signal == "WAIT":
-        stats["skipped"] += 1
-        log(
-            f"⏳ {symbol} — WAIT | "
-            f"RSI: {indicators.get('rsi', 0):.1f} | "
-            f"Long: {indicators.get('long_score', 0)}/4 | "
-            f"Short: {indicators.get('short_score', 0)}/4"
-        )
-        return
-
-    current_price = closes[-1]
+async def open_trade(session, symbol, signal, info):
+    price = info["price"]
 
     if signal == "LONG":
-        tp_price = current_price * (1 + TAKE_PROFIT_PCT)
-        sl_price = current_price * (1 - STOP_LOSS_PCT)
+        tp = price * (1 + TAKE_PROFIT_PCT)
+        sl = price * (1 - STOP_LOSS_PCT)
         side = "BUY"
     else:
-        tp_price = current_price * (1 - TAKE_PROFIT_PCT)
-        sl_price = current_price * (1 + STOP_LOSS_PCT)
+        tp = price * (1 - TAKE_PROFIT_PCT)
+        sl = price * (1 + STOP_LOSS_PCT)
         side = "SELL"
-
-    size = round((MARGIN_PER_TRADE * LEVERAGE) / current_price, 4)
-    result = await place_order(session, symbol, side, size)
-    if not result:
-        return
 
     trade_id = f"{symbol}_{int(time.time())}"
     active_positions[trade_id] = {
         "symbol": symbol,
         "side": signal,
-        "entry_price": current_price,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "size": size,
+        "entry_price": price,
+        "tp_price": tp,
+        "sl_price": sl,
         "entry_time": time.time(),
         "margin": MARGIN_PER_TRADE,
         "closed": False
@@ -312,27 +220,70 @@ async def scalp_symbol(session, symbol):
 
     stats["total_trades"] += 1
 
-    rsi = indicators.get("rsi", 0)
-    long_score = indicators.get("long_score", 0)
-    short_score = indicators.get("short_score", 0)
-    vol_ok = "✅" if indicators.get("vol_increasing") else "❌"
-
+    vol_emoji = "✅" if info["vol_up"] else "❌"
     msg = (
-        f"⚡ SCALP TRADE!\n"
+        f"⚡ TRADE #{stats['total_trades']} IMEFUNGULIWA!\n"
         f"📊 {symbol}\n"
         f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
-        f"💲 Bei: ${current_price:.2f}\n"
-        f"🎯 TP: ${tp_price:.2f} (+{TAKE_PROFIT_PCT*100:.1f}%)\n"
-        f"🛑 SL: ${sl_price:.2f} (-{STOP_LOSS_PCT*100:.1f}%)\n"
+        f"💲 Bei: ${price:,.2f}\n"
+        f"🎯 TP: ${tp:,.2f} (+{TAKE_PROFIT_PCT*100:.1f}%)\n"
+        f"🛑 SL: ${sl:,.2f} (-{STOP_LOSS_PCT*100:.1f}%)\n"
+        f"⏱️ Max Hold: {MAX_HOLD_MINUTES} dakika\n"
         f"━━━━━━━━━━━━━\n"
-        f"📈 RSI: {rsi:.1f}\n"
-        f"📊 MACD: {'✅' if indicators.get('macd_crossed_up') or indicators.get('macd_crossed_down') else '↗️'}\n"
+        f"📈 RSI: {info['rsi']:.1f}\n"
+        f"📊 MACD: {'✅' if macd_bullish(info) else '🔴'}\n"
         f"📉 Bollinger: ✅\n"
-        f"📦 Volume: {vol_ok}\n"
-        f"🎯 Score: {max(long_score, short_score)}/4\n"
+        f"📦 Volume: {vol_emoji}\n"
+        f"🎯 Score: {max(info['long_score'], info['short_score'])}/4\n"
         f"━━━━━━━━━━━━━\n"
         f"💰 Margin: ${MARGIN_PER_TRADE} x {LEVERAGE}x\n"
-        f"🔢 Trade #{stats['total_trades']}\n"
+        f"🧪 SIMULATION"
+    )
+    log(msg)
+    await send_telegram(session, msg)
+
+def macd_bullish(info):
+    return info["macd"] > info["macd_signal"]
+
+async def close_trade(session, trade_id, current_price, reason):
+    pos = active_positions[trade_id]
+    pos["closed"] = True
+
+    if pos["side"] == "LONG":
+        pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+    else:
+        pnl_pct = (pos["entry_price"] - current_price) / pos["entry_price"]
+
+    pnl_usd = pnl_pct * pos["margin"] * LEVERAGE
+
+    if pnl_usd > 0:
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+    stats["total_pnl"] += pnl_usd
+
+    hold_min = (time.time() - pos["entry_time"]) / 60
+    win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
+
+    if reason == "TP":
+        emoji = "💰 TAKE PROFIT!"
+    elif reason == "SL":
+        emoji = "🛑 STOP LOSS!"
+    else:
+        emoji = "⏱️ FORCE CLOSE!"
+
+    msg = (
+        f"{emoji}\n"
+        f"📊 {pos['symbol']}\n"
+        f"{'🟢 LONG' if pos['side'] == 'LONG' else '🔴 SHORT'}\n"
+        f"💲 Entry: ${pos['entry_price']:,.2f}\n"
+        f"💲 Exit: ${current_price:,.2f}\n"
+        f"⏱️ Hold: {hold_min:.1f} dakika\n"
+        f"━━━━━━━━━━━━━\n"
+        f"💵 PnL: {'+' if pnl_usd >= 0 else ''}{pnl_usd:.2f} USDT\n"
+        f"📊 Total PnL: ${stats['total_pnl']:.2f} USDT\n"
+        f"🏆 Win Rate: {win_rate:.1f}%\n"
+        f"✅ {stats['wins']} Wins | ❌ {stats['losses']} Losses\n"
         f"🧪 SIMULATION"
     )
     log(msg)
@@ -349,62 +300,60 @@ async def monitor_positions(session):
                 if current_price == 0:
                     continue
 
-                if pos["side"] == "LONG":
-                    pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
-                else:
-                    pnl_pct = (pos["entry_price"] - current_price) / pos["entry_price"]
-
-                pnl_usd = pnl_pct * pos["margin"] * LEVERAGE
+                elapsed_min = (time.time() - pos["entry_time"]) / 60
 
                 tp_hit = (pos["side"] == "LONG" and current_price >= pos["tp_price"]) or \
                          (pos["side"] == "SHORT" and current_price <= pos["tp_price"])
                 sl_hit = (pos["side"] == "LONG" and current_price <= pos["sl_price"]) or \
                          (pos["side"] == "SHORT" and current_price >= pos["sl_price"])
+                time_up = elapsed_min >= MAX_HOLD_MINUTES
 
-                if tp_hit or sl_hit:
-                    pos["closed"] = True
-                    if tp_hit:
-                        stats["wins"] += 1
-                        stats["total_pnl"] += pnl_usd
-                        result_emoji = "💰 TAKE PROFIT!"
-                    else:
-                        stats["losses"] += 1
-                        stats["total_pnl"] += pnl_usd
-                        result_emoji = "🛑 STOP LOSS!"
+                if tp_hit:
+                    await close_trade(session, trade_id, current_price, "TP")
+                elif sl_hit:
+                    await close_trade(session, trade_id, current_price, "SL")
+                elif time_up:
+                    await close_trade(session, trade_id, current_price, "TIME")
 
-                    hold_min = (time.time() - pos["entry_time"]) / 60
-                    win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
-
-                    msg = (
-                        f"{result_emoji}\n"
-                        f"📊 {pos['symbol']}\n"
-                        f"{'🟢 LONG' if pos['side'] == 'LONG' else '🔴 SHORT'}\n"
-                        f"💲 Entry: ${pos['entry_price']:.2f}\n"
-                        f"💲 Exit: ${current_price:.2f}\n"
-                        f"⏱️ Hold: {hold_min:.1f} dakika\n"
-                        f"━━━━━━━━━━━━━\n"
-                        f"💵 PnL: {'+' if pnl_usd > 0 else ''}{pnl_usd:.2f} USDT\n"
-                        f"📊 Total PnL: ${stats['total_pnl']:.2f} USDT\n"
-                        f"🏆 Win Rate: {win_rate:.1f}%\n"
-                        f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
-                        f"🧪 SIMULATION"
-                    )
-                    log(msg)
-                    await send_telegram(session, msg)
-
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
         except Exception as e:
             log(f"Monitor error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
-async def run_dual_scalper(session):
+async def run_scalper(session):
     while True:
         try:
-            await scalp_symbol(session, SYMBOL_1)
-            await asyncio.sleep(3)
-            await scalp_symbol(session, SYMBOL_2)
+            for symbol in [SYMBOL_1, SYMBOL_2]:
+                open_count = sum(
+                    1 for p in active_positions.values()
+                    if symbol in p["symbol"] and not p["closed"]
+                )
+                if open_count >= 1:
+                    log(f"⏳ {symbol} — trade iko wazi tayari")
+                    continue
+
+                closes, volumes = await get_candles(session, symbol)
+                if not closes:
+                    continue
+
+                signal, info = analyze_market(closes, volumes)
+
+                if signal == "WAIT":
+                    stats["skipped"] += 1
+                    log(
+                        f"⏳ {symbol} WAIT | "
+                        f"RSI:{info.get('rsi', 0):.0f} | "
+                        f"L:{info.get('long_score', 0)}/4 "
+                        f"S:{info.get('short_score', 0)}/4"
+                    )
+                else:
+                    await open_trade(session, symbol, signal, info)
+
+                await asyncio.sleep(3)
+
             await asyncio.sleep(CHECK_INTERVAL)
+
         except Exception as e:
             log(f"Scalper error: {e}")
             await asyncio.sleep(10)
@@ -413,14 +362,16 @@ async def print_stats(session):
     while True:
         await asyncio.sleep(300)
         win_rate = (stats["wins"] / max(stats["total_trades"], 1)) * 100
+        open_trades = sum(1 for p in active_positions.values() if not p["closed"])
         msg = (
             f"📊 RIPOTI YA DAKIKA 5\n"
             f"⚡ Trades: {stats['total_trades']}\n"
+            f"🔓 Wazi sasa: {open_trades}\n"
             f"⏳ Skipped: {stats['skipped']}\n"
             f"✅ Wins: {stats['wins']} | ❌ Losses: {stats['losses']}\n"
             f"🏆 Win Rate: {win_rate:.1f}%\n"
             f"💰 Total PnL: ${stats['total_pnl']:.2f} USDT\n"
-            f"🔢 Leverage: {LEVERAGE}x | TF: {TIMEFRAME}\n"
+            f"🎯 TP: {TAKE_PROFIT_PCT*100:.1f}% | SL: {STOP_LOSS_PCT*100:.1f}%\n"
             f"🧪 SIMULATION"
         )
         log(msg)
@@ -429,21 +380,22 @@ async def print_stats(session):
 async def main():
     async with aiohttp.ClientSession() as session:
         start_msg = (
-            f"⚡ OKX DUAL FUTURES SCALPER V2!\n"
+            f"⚡ OKX DUAL FUTURES SCALPER V3!\n"
             f"📊 BTC + ETH Futures\n"
             f"⏱️ Timeframe: {TIMEFRAME}\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
             f"💰 Margin: ${MARGIN_PER_TRADE}/trade\n"
-            f"🎯 TP: {TAKE_PROFIT_PCT*100:.1f}% | SL: {STOP_LOSS_PCT*100:.1f}%\n"
-            f"📈 Indicators: RSI + MACD + BB + Volume\n"
-            f"🎯 Min Score: 3/4 kuingia trade\n"
-            f"🧪 Mode: SIMULATION"
+            f"🎯 TP: {TAKE_PROFIT_PCT*100:.1f}%\n"
+            f"🛑 SL: {STOP_LOSS_PCT*100:.1f}%\n"
+            f"⏱️ Force Close: {MAX_HOLD_MINUTES} dakika\n"
+            f"📈 RSI + MACD + BB + Volume\n"
+            f"🧪 SIMULATION"
         )
         log(start_msg)
         await send_telegram(session, start_msg)
 
         await asyncio.gather(
-            run_dual_scalper(session),
+            run_scalper(session),
             monitor_positions(session),
             print_stats(session)
         )
