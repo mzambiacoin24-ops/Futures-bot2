@@ -19,13 +19,13 @@ CAPITAL = 20.0
 LEVERAGE = 5
 FIRST_ENTRY_PCT = 0.30
 ADD_ENTRY_PCT = 0.20
-TP_PCT = 0.03
-SL_PCT = 0.015
+TP_PCT = 0.04
+SL_PCT = 0.025
 ADD_THRESHOLD_PCT = 0.015
 
 MIN_VOLUME_USD = 1_000_000
 MIN_CHANGE_PCT = 2.0
-MAX_CHANGE_PCT = 12.0
+MAX_CHANGE_PCT = 15.0
 SCAN_INTERVAL = 300
 MONITOR_INTERVAL = 15
 
@@ -57,47 +57,19 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-async def get_all_futures(session):
-    try:
-        path = "/api/v5/market/tickers?instType=SWAP"
-        async with session.get(OKX_BASE + path) as r:
-            data = await r.json()
-            tickers = data.get("data", [])
-            result = []
-            for t in tickers:
-                inst_id = t.get("instId", "")
-                if not inst_id.endswith("-USDT-SWAP"):
-                    continue
-                vol = float(t.get("volCcy24h", 0))
-                price = float(t.get("last", 0))
-                change = float(t.get("sodUtc8", price))
-                if change > 0:
-                    change_pct = abs((price - change) / change * 100)
-                else:
-                    change_pct = 0
-                vol_usd = vol * price
-                result.append({
-                    "instId": inst_id,
-                    "price": price,
-                    "change_pct": change_pct,
-                    "vol_usd": vol_usd
-                })
-            return result
-    except Exception as e:
-        log(f"Tickers error: {e}")
-        return []
-
-async def get_candles(session, inst_id, bar="15m", limit=50):
+async def get_candles(session, inst_id, bar="15m", limit=100):
     try:
         path = f"/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
         async with session.get(OKX_BASE + path) as r:
             data = await r.json()
             candles = list(reversed(data.get("data", [])))
             closes = [float(c[4]) for c in candles]
+            highs = [float(c[2]) for c in candles]
+            lows = [float(c[3]) for c in candles]
             volumes = [float(c[5]) for c in candles]
-            return closes, volumes
+            return closes, highs, lows, volumes
     except:
-        return [], []
+        return [], [], [], []
 
 async def get_price(session, inst_id):
     try:
@@ -107,6 +79,31 @@ async def get_price(session, inst_id):
             return float(data.get("data", [{}])[0].get("last", 0))
     except:
         return 0.0
+
+async def get_all_futures(session):
+    try:
+        path = "/api/v5/market/tickers?instType=SWAP"
+        async with session.get(OKX_BASE + path) as r:
+            data = await r.json()
+            result = []
+            for t in data.get("data", []):
+                inst_id = t.get("instId", "")
+                if not inst_id.endswith("-USDT-SWAP"):
+                    continue
+                price = float(t.get("last", 0))
+                vol = float(t.get("volCcy24h", 0))
+                vol_usd = vol * price
+                sod = float(t.get("sodUtc8", price))
+                change_pct = abs((price - sod) / sod * 100) if sod > 0 else 0
+                result.append({
+                    "instId": inst_id,
+                    "price": price,
+                    "change_pct": change_pct,
+                    "vol_usd": vol_usd
+                })
+            return result
+    except:
+        return []
 
 def ema(closes, period):
     if len(closes) < period:
@@ -128,57 +125,76 @@ def rsi(closes, period=14):
         return 100
     return 100 - (100 / (1 + ag / al))
 
-def macd(closes):
-    if len(closes) < 35:
-        return 0, 0
-    e12 = ema(closes, 12)
-    e26 = ema(closes, 26)
-    macd_line = e12 - e26
-    macd_hist = []
-    for i in range(26, len(closes)):
-        m = ema(closes[:i], 12) - ema(closes[:i], 26)
-        macd_hist.append(m)
-    if len(macd_hist) < 9:
-        return macd_line, 0
-    signal = ema(macd_hist, 9)
-    return macd_line, signal
+def get_trend_1h(closes_1h):
+    if len(closes_1h) < 50:
+        return "SIDEWAYS"
+    e20 = ema(closes_1h, 20)
+    e50 = ema(closes_1h, 50)
+    price = closes_1h[-1]
+    last_5 = closes_1h[-5:]
+    higher_highs = last_5[-1] > last_5[0]
+    lower_lows = last_5[-1] < last_5[0]
+    if price > e20 > e50 and higher_highs:
+        return "UPTREND"
+    elif price < e20 < e50 and lower_lows:
+        return "DOWNTREND"
+    return "SIDEWAYS"
 
-def analyze(closes, volumes):
-    if len(closes) < 30:
-        return "WAIT", 0
+def analyze_15m(closes, volumes, trend):
+    if len(closes) < 50:
+        return "WAIT", {}
 
-    r = rsi(closes)
+    r = rsi(closes, 14)
     e9 = ema(closes, 9)
     e21 = ema(closes, 21)
-    m, ms = macd(closes)
     price = closes[-1]
-    vol_ok = sum(volumes[-3:]) / 3 > sum(volumes[-10:-3]) / 7 * 1.2
 
-    long_score = sum([
-        r < 45,
-        e9 > e21,
-        price > e9,
-        m > ms,
-        vol_ok
-    ])
+    prev_e9 = ema(closes[:-1], 9)
+    prev_e21 = ema(closes[:-1], 21)
+    ema_crossed_up = prev_e9 <= prev_e21 and e9 > e21
+    ema_crossed_down = prev_e9 >= prev_e21 and e9 < e21
 
-    short_score = sum([
-        r > 55,
-        e9 < e21,
-        price < e9,
-        m < ms,
-        vol_ok
-    ])
+    vol_surge = sum(volumes[-3:]) / 3 > sum(volumes[-10:-3]) / 7 * 1.3 if len(volumes) >= 10 else False
 
-    if long_score >= 4:
-        return "LONG", long_score
-    elif short_score >= 4:
-        return "SHORT", short_score
-    return "WAIT", 0
+    info = {
+        "rsi": r,
+        "e9": e9,
+        "e21": e21,
+        "price": price,
+        "trend": trend,
+        "vol_surge": vol_surge,
+        "ema_crossed_up": ema_crossed_up,
+        "ema_crossed_down": ema_crossed_down
+    }
+
+    if trend == "UPTREND":
+        if (
+            25 < r < 55 and
+            e9 > e21 and
+            price > e9 and
+            vol_surge
+        ):
+            return "LONG", info
+
+    elif trend == "DOWNTREND":
+        if (
+            45 < r < 75 and
+            e9 < e21 and
+            price < e9 and
+            vol_surge
+        ):
+            return "SHORT", info
+
+    elif trend == "SIDEWAYS":
+        if r < 30 and ema_crossed_up and vol_surge:
+            return "LONG", info
+        elif r > 70 and ema_crossed_down and vol_surge:
+            return "SHORT", info
+
+    return "WAIT", info
 
 async def scan_best_coin(session):
-    log("🔍 Inascan coins zote za OKX Futures...")
-
+    log("🔍 Inascan coins...")
     tickers = await get_all_futures(session)
 
     candidates = [
@@ -186,33 +202,46 @@ async def scan_best_coin(session):
         if t["vol_usd"] >= MIN_VOLUME_USD
         and MIN_CHANGE_PCT <= t["change_pct"] <= MAX_CHANGE_PCT
     ]
-
     candidates.sort(key=lambda x: x["vol_usd"], reverse=True)
 
     best_coin = None
     best_signal = "WAIT"
-    best_score = 0
+    best_info = {}
     best_price = 0
 
-    for coin in candidates[:20]:
+    for coin in candidates[:25]:
         inst_id = coin["instId"]
-        closes, volumes = await get_candles(session, inst_id)
-        if not closes:
+
+        closes_1h, _, _, _ = await get_candles(session, inst_id, "1H", 60)
+        if not closes_1h:
             continue
 
-        signal, score = analyze(closes, volumes)
-        if signal != "WAIT" and score > best_score:
+        trend = get_trend_1h(closes_1h)
+
+        if trend == "SIDEWAYS":
+            log(f"⏭️ {inst_id} — SIDEWAYS, inaruka...")
+            await asyncio.sleep(0.2)
+            continue
+
+        closes_15m, _, _, volumes_15m = await get_candles(session, inst_id, "15m", 100)
+        if not closes_15m:
+            continue
+
+        signal, info = analyze_15m(closes_15m, volumes_15m, trend)
+
+        if signal != "WAIT":
+            log(f"✅ {inst_id} | {signal} | Trend: {trend} | RSI: {info.get('rsi', 0):.1f}")
             best_coin = inst_id
             best_signal = signal
-            best_score = score
-            best_price = closes[-1]
-            log(f"✅ Candidate: {inst_id} | {signal} | Score: {score}/5")
+            best_info = info
+            best_price = closes_15m[-1]
+            break
 
         await asyncio.sleep(0.3)
 
-    return best_coin, best_signal, best_price
+    return best_coin, best_signal, best_price, best_info
 
-async def open_trade(session, inst_id, signal, price):
+async def open_trade(session, inst_id, signal, price, info):
     global active_trade
 
     margin_1 = CAPITAL * FIRST_ENTRY_PCT
@@ -239,6 +268,9 @@ async def open_trade(session, inst_id, signal, price):
     }
 
     coin_name = inst_id.replace("-SWAP", "")
+    trend = info.get("trend", "")
+    r = info.get("rsi", 0)
+    vol = "✅" if info.get("vol_surge") else "❌"
 
     msg = (
         f"🎯 IMEINGIA TRADE!\n"
@@ -249,7 +281,10 @@ async def open_trade(session, inst_id, signal, price):
         f"🎯 TP: {tp_price}\n"
         f"🛑 SL: {sl_price}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💰 Margin: ${margin_1:.2f} ({FIRST_ENTRY_PCT*100:.0f}% ya ${CAPITAL})\n"
+        f"📈 Trend 1H: {trend}\n"
+        f"📊 RSI: {r:.1f}\n"
+        f"📦 Volume: {vol}\n"
+        f"💰 Margin: ${margin_1:.2f}\n"
         f"🔢 Leverage: {LEVERAGE}x\n"
         f"🧪 SIMULATION"
     )
@@ -284,17 +319,14 @@ async def monitor_trade(session):
                 trade["current_size"] += size_2
                 trade["total_margin"] += margin_2
                 trade["added"] = True
-
                 msg = (
                     f"➕ IMEONGEZA POSITION!\n"
                     f"📊 {coin_name}\n"
-                    f"💲 Bei sasa: {price}\n"
+                    f"💲 Bei: {price}\n"
                     f"💰 Imeongeza: ${margin_2:.2f}\n"
-                    f"💰 Jumla Margin: ${trade['total_margin']:.2f}\n"
-                    f"📈 Faida hadi sasa: {change*100:+.2f}%\n"
+                    f"📈 Faida: {change*100:+.2f}%\n"
                     f"🧪 SIMULATION"
                 )
-                log(msg)
                 await send_telegram(session, msg)
 
             tp_hit = (trade["signal"] == "LONG" and price >= trade["tp_price"]) or \
@@ -324,12 +356,12 @@ async def monitor_trade(session):
                     f"{'🟢 LONG' if trade['signal'] == 'LONG' else '🔴 SHORT'}\n"
                     f"💲 Entry: {trade['entry_price']}\n"
                     f"💲 Exit: {price}\n"
-                    f"⏱️ Hold: {hold:.0f} dakika\n"
+                    f"⏱️ {hold:.0f} dakika\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"💵 PnL: {'+' if pnl >= 0 else ''}{pnl:.3f} USDT\n"
-                    f"📊 Jumla PnL: {stats['pnl']:+.3f} USDT\n"
+                    f"📊 Jumla: {stats['pnl']:+.3f} USDT\n"
                     f"🏆 Win Rate: {win_rate:.0f}%\n"
-                    f"✅ {stats['wins']} Wins | ❌ {stats['losses']} Losses\n"
+                    f"✅ {stats['wins']} | ❌ {stats['losses']}\n"
                     f"🧪 SIMULATION"
                 )
                 log(msg)
@@ -344,27 +376,24 @@ async def monitor_trade(session):
 
 async def scanner_loop(session):
     global active_trade
-
     await asyncio.sleep(5)
 
     while True:
         try:
             if active_trade and not active_trade["closed"]:
-                log(f"⏳ Trade iko wazi: {active_trade['inst_id']} — inasubiri...")
+                log(f"⏳ Trade wazi: {active_trade['inst_id']}")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
             await send_telegram(session, "🔍 Inatafuta coin nzuri...")
-
-            best_coin, signal, price = await scan_best_coin(session)
+            best_coin, signal, price, info = await scan_best_coin(session)
 
             if not best_coin:
-                log("❌ Hakuna coin nzuri — itajaribu tena dakika 5...")
-                await send_telegram(session, "❌ Hakuna coin nzuri sasa.\n🔄 Itajaribu tena dakika 5...")
+                await send_telegram(session, "⏳ Hakuna signal nzuri sasa.\n🔄 Dakika 5...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            await open_trade(session, best_coin, signal, price)
+            await open_trade(session, best_coin, signal, price, info)
             await asyncio.sleep(SCAN_INTERVAL)
 
         except Exception as e:
@@ -374,23 +403,18 @@ async def scanner_loop(session):
 async def main():
     async with aiohttp.ClientSession() as session:
         msg = (
-            f"⚡ OKX DUAL FUTURES BOT IMEANZA!\n"
+            f"⚡ OKX DUAL FUTURES BOT V2!\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💰 Capital: ${CAPITAL}\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
             f"🎯 TP: {TP_PCT*100:.0f}% | SL: {SL_PCT*100:.1f}%\n"
-            f"📊 Entry 1: {FIRST_ENTRY_PCT*100:.0f}% ya capital\n"
-            f"📊 Entry 2: {ADD_ENTRY_PCT*100:.0f}% (ikielekea vizuri)\n"
-            f"🔍 Scan kila: {SCAN_INTERVAL//60} dakika\n"
+            f"🧠 Trend: 1H | Signal: 15m\n"
+            f"📊 Entry: {FIRST_ENTRY_PCT*100:.0f}% + {ADD_ENTRY_PCT*100:.0f}%\n"
             f"🧪 SIMULATION"
         )
         log(msg)
         await send_telegram(session, msg)
-
-        await asyncio.gather(
-            scanner_loop(session),
-            monitor_trade(session)
-        )
+        await asyncio.gather(scanner_loop(session), monitor_trade(session))
 
 if __name__ == "__main__":
     asyncio.run(main())
