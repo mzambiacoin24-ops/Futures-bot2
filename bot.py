@@ -19,15 +19,15 @@ CAPITAL = 20.0
 LEVERAGE = 5
 FIRST_ENTRY_PCT = 0.30
 ADD_ENTRY_PCT = 0.20
-TP_PCT = 0.04
-SL_PCT = 0.025
-ADD_THRESHOLD_PCT = 0.015
+TP_PCT = 0.02
+SL_PCT = 0.012
+ADD_THRESHOLD_PCT = 0.01
 
-MIN_VOLUME_USD = 1_000_000
-MIN_CHANGE_PCT = 2.0
-MAX_CHANGE_PCT = 15.0
+MIN_VOLUME_USD = 2_000_000
+MIN_MOMENTUM_PCT = 1.0
+MAX_MOMENTUM_PCT = 8.0
 SCAN_INTERVAL = 300
-MONITOR_INTERVAL = 15
+MONITOR_INTERVAL = 10
 
 active_trade = None
 stats = {"wins": 0, "losses": 0, "pnl": 0.0}
@@ -57,28 +57,20 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-async def get_candles(session, inst_id, bar="15m", limit=100):
-    try:
-        path = f"/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
-        async with session.get(OKX_BASE + path) as r:
-            data = await r.json()
-            candles = list(reversed(data.get("data", [])))
-            closes = [float(c[4]) for c in candles]
-            highs = [float(c[2]) for c in candles]
-            lows = [float(c[3]) for c in candles]
-            volumes = [float(c[5]) for c in candles]
-            return closes, highs, lows, volumes
-    except:
-        return [], [], [], []
-
-async def get_price(session, inst_id):
+async def get_ticker(session, inst_id):
     try:
         path = f"/api/v5/market/ticker?instId={inst_id}"
         async with session.get(OKX_BASE + path) as r:
             data = await r.json()
-            return float(data.get("data", [{}])[0].get("last", 0))
+            t = data.get("data", [{}])[0]
+            return {
+                "price": float(t.get("last", 0)),
+                "high24h": float(t.get("high24h", 0)),
+                "low24h": float(t.get("low24h", 0)),
+                "vol_usd": float(t.get("volCcy24h", 0)) * float(t.get("last", 0))
+            }
     except:
-        return 0.0
+        return None
 
 async def get_all_futures(session):
     try:
@@ -93,17 +85,42 @@ async def get_all_futures(session):
                 price = float(t.get("last", 0))
                 vol = float(t.get("volCcy24h", 0))
                 vol_usd = vol * price
+                high24h = float(t.get("high24h", 0))
+                low24h = float(t.get("low24h", 0))
                 sod = float(t.get("sodUtc8", price))
-                change_pct = abs((price - sod) / sod * 100) if sod > 0 else 0
+                change_24h = ((price - sod) / sod * 100) if sod > 0 else 0
                 result.append({
                     "instId": inst_id,
                     "price": price,
-                    "change_pct": change_pct,
+                    "high24h": high24h,
+                    "low24h": low24h,
+                    "change_24h": change_24h,
                     "vol_usd": vol_usd
                 })
             return result
     except:
         return []
+
+async def get_candles(session, inst_id, bar="15m", limit=60):
+    try:
+        path = f"/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
+        async with session.get(OKX_BASE + path) as r:
+            data = await r.json()
+            candles = list(reversed(data.get("data", [])))
+            closes = [float(c[4]) for c in candles]
+            volumes = [float(c[5]) for c in candles]
+            return closes, volumes
+    except:
+        return [], []
+
+async def get_price(session, inst_id):
+    try:
+        path = f"/api/v5/market/ticker?instId={inst_id}"
+        async with session.get(OKX_BASE + path) as r:
+            data = await r.json()
+            return float(data.get("data", [{}])[0].get("last", 0))
+    except:
+        return 0.0
 
 def ema(closes, period):
     if len(closes) < period:
@@ -125,152 +142,191 @@ def rsi(closes, period=14):
         return 100
     return 100 - (100 / (1 + ag / al))
 
-def get_trend_1h(closes_1h):
-    if len(closes_1h) < 50:
+def get_momentum(closes):
+    if len(closes) < 6:
+        return 0
+    recent = closes[-3:]
+    prev = closes[-6:-3]
+    avg_recent = sum(recent) / 3
+    avg_prev = sum(prev) / 3
+    if avg_prev == 0:
+        return 0
+    return (avg_recent - avg_prev) / avg_prev * 100
+
+def get_trend(closes_1h):
+    if len(closes_1h) < 20:
         return "SIDEWAYS"
+    e10 = ema(closes_1h, 10)
     e20 = ema(closes_1h, 20)
-    e50 = ema(closes_1h, 50)
     price = closes_1h[-1]
-    last_5 = closes_1h[-5:]
-    higher_highs = last_5[-1] > last_5[0]
-    lower_lows = last_5[-1] < last_5[0]
-    if price > e20 > e50 and higher_highs:
+    if price > e10 > e20:
         return "UPTREND"
-    elif price < e20 < e50 and lower_lows:
+    elif price < e10 < e20:
         return "DOWNTREND"
     return "SIDEWAYS"
 
-def analyze_15m(closes, volumes, trend):
-    if len(closes) < 50:
+def analyze(closes_15m, volumes, trend, high24h, low24h):
+    if len(closes_15m) < 30:
         return "WAIT", {}
 
-    r = rsi(closes, 14)
-    e9 = ema(closes, 9)
-    e21 = ema(closes, 21)
-    price = closes[-1]
+    price = closes_15m[-1]
+    r = rsi(closes_15m)
+    e9 = ema(closes_15m, 9)
+    e21 = ema(closes_15m, 21)
+    momentum = get_momentum(closes_15m)
+    vol_ok = sum(volumes[-3:]) / 3 > sum(volumes[-8:-3]) / 5 * 1.2 if len(volumes) >= 8 else False
 
-    prev_e9 = ema(closes[:-1], 9)
-    prev_e21 = ema(closes[:-1], 21)
-    ema_crossed_up = prev_e9 <= prev_e21 and e9 > e21
-    ema_crossed_down = prev_e9 >= prev_e21 and e9 < e21
-
-    vol_surge = sum(volumes[-3:]) / 3 > sum(volumes[-10:-3]) / 7 * 1.3 if len(volumes) >= 10 else False
+    range_24h = high24h - low24h
+    price_position = (price - low24h) / range_24h * 100 if range_24h > 0 else 50
 
     info = {
         "rsi": r,
-        "e9": e9,
-        "e21": e21,
-        "price": price,
+        "momentum": momentum,
+        "price_position": price_position,
+        "vol_ok": vol_ok,
         "trend": trend,
-        "vol_surge": vol_surge,
-        "ema_crossed_up": ema_crossed_up,
-        "ema_crossed_down": ema_crossed_down
+        "high24h": high24h,
+        "low24h": low24h,
+        "price": price
     }
 
     if trend == "UPTREND":
         if (
-            25 < r < 55 and
+            30 < r < 60 and
             e9 > e21 and
-            price > e9 and
-            vol_surge
+            momentum > 0.3 and
+            price_position < 75 and
+            vol_ok
         ):
             return "LONG", info
 
     elif trend == "DOWNTREND":
         if (
-            45 < r < 75 and
+            40 < r < 70 and
             e9 < e21 and
-            price < e9 and
-            vol_surge
+            momentum < -0.3 and
+            price_position > 25 and
+            vol_ok
         ):
-            return "SHORT", info
-
-    elif trend == "SIDEWAYS":
-        if r < 30 and ema_crossed_up and vol_surge:
-            return "LONG", info
-        elif r > 70 and ema_crossed_down and vol_surge:
             return "SHORT", info
 
     return "WAIT", info
 
+def calc_realistic_tp_sl(signal, price, high24h, low24h, trend):
+    range_24h = high24h - low24h
+
+    if signal == "LONG":
+        room_to_high = (high24h - price) / price
+        tp_pct = min(TP_PCT, room_to_high * 0.7)
+        if tp_pct < 0.008:
+            return None, None
+        tp = round(price * (1 + tp_pct), 6)
+        sl = round(price * (1 - SL_PCT), 6)
+
+    else:
+        room_to_low = (price - low24h) / price
+        tp_pct = min(TP_PCT, room_to_low * 0.7)
+        if tp_pct < 0.008:
+            return None, None
+        tp = round(price * (1 - tp_pct), 6)
+        sl = round(price * (1 + SL_PCT), 6)
+
+    return tp, sl
+
 async def scan_best_coin(session):
-    log("🔍 Inascan coins...")
+    log("🔍 Inascan coins kwa momentum ya sasa...")
     tickers = await get_all_futures(session)
 
     candidates = [
         t for t in tickers
         if t["vol_usd"] >= MIN_VOLUME_USD
-        and MIN_CHANGE_PCT <= t["change_pct"] <= MAX_CHANGE_PCT
+        and MIN_MOMENTUM_PCT <= abs(t["change_24h"]) <= MAX_MOMENTUM_PCT
     ]
     candidates.sort(key=lambda x: x["vol_usd"], reverse=True)
 
     best_coin = None
     best_signal = "WAIT"
     best_info = {}
+    best_tp = 0
+    best_sl = 0
     best_price = 0
 
-    for coin in candidates[:25]:
+    for coin in candidates[:30]:
         inst_id = coin["instId"]
 
-        closes_1h, _, _, _ = await get_candles(session, inst_id, "1H", 60)
+        closes_1h, _ = await get_candles(session, inst_id, "1H", 30)
         if not closes_1h:
             continue
 
-        trend = get_trend_1h(closes_1h)
-
+        trend = get_trend(closes_1h)
         if trend == "SIDEWAYS":
-            log(f"⏭️ {inst_id} — SIDEWAYS, inaruka...")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
             continue
 
-        closes_15m, _, _, volumes_15m = await get_candles(session, inst_id, "15m", 100)
+        closes_15m, volumes_15m = await get_candles(session, inst_id, "15m", 60)
         if not closes_15m:
             continue
 
-        signal, info = analyze_15m(closes_15m, volumes_15m, trend)
+        signal, info = analyze(
+            closes_15m, volumes_15m, trend,
+            coin["high24h"], coin["low24h"]
+        )
 
-        if signal != "WAIT":
-            log(f"✅ {inst_id} | {signal} | Trend: {trend} | RSI: {info.get('rsi', 0):.1f}")
-            best_coin = inst_id
-            best_signal = signal
-            best_info = info
-            best_price = closes_15m[-1]
-            break
+        if signal == "WAIT":
+            await asyncio.sleep(0.1)
+            continue
 
-        await asyncio.sleep(0.3)
+        tp, sl = calc_realistic_tp_sl(
+            signal, coin["price"],
+            coin["high24h"], coin["low24h"], trend
+        )
 
-    return best_coin, best_signal, best_price, best_info
+        if tp is None:
+            log(f"⏭️ {inst_id} — TP room ndogo sana, inaruka...")
+            await asyncio.sleep(0.1)
+            continue
 
-async def open_trade(session, inst_id, signal, price, info):
+        log(f"✅ {inst_id} | {signal} | Trend:{trend} | RSI:{info['rsi']:.1f} | Mom:{info['momentum']:.2f}%")
+        best_coin = inst_id
+        best_signal = signal
+        best_info = info
+        best_tp = tp
+        best_sl = sl
+        best_price = coin["price"]
+        break
+
+        await asyncio.sleep(0.2)
+
+    return best_coin, best_signal, best_price, best_info, best_tp, best_sl
+
+async def open_trade(session, inst_id, signal, price, info, tp, sl):
     global active_trade
 
     margin_1 = CAPITAL * FIRST_ENTRY_PCT
-    size_1 = (margin_1 * LEVERAGE) / price
-
-    if signal == "LONG":
-        tp_price = round(price * (1 + TP_PCT), 6)
-        sl_price = round(price * (1 - SL_PCT), 6)
-    else:
-        tp_price = round(price * (1 - TP_PCT), 6)
-        sl_price = round(price * (1 + SL_PCT), 6)
 
     active_trade = {
         "inst_id": inst_id,
         "signal": signal,
         "entry_price": price,
-        "current_size": size_1,
         "total_margin": margin_1,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
+        "tp_price": tp,
+        "sl_price": sl,
         "entry_time": time.time(),
         "added": False,
         "closed": False
     }
 
     coin_name = inst_id.replace("-SWAP", "")
-    trend = info.get("trend", "")
     r = info.get("rsi", 0)
-    vol = "✅" if info.get("vol_surge") else "❌"
+    mom = info.get("momentum", 0)
+    pos = info.get("price_position", 0)
+    trend = info.get("trend", "")
+    vol = "✅" if info.get("vol_ok") else "❌"
+    high24h = info.get("high24h", 0)
+    low24h = info.get("low24h", 0)
+
+    tp_pct = abs(tp - price) / price * 100
+    sl_pct = abs(sl - price) / price * 100
 
     msg = (
         f"🎯 IMEINGIA TRADE!\n"
@@ -278,12 +334,16 @@ async def open_trade(session, inst_id, signal, price, info):
         f"📊 {coin_name}\n"
         f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
         f"💲 Entry: {price}\n"
-        f"🎯 TP: {tp_price}\n"
-        f"🛑 SL: {sl_price}\n"
+        f"🎯 TP: {tp} (+{tp_pct:.1f}%)\n"
+        f"🛑 SL: {sl} (-{sl_pct:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 Trend 1H: {trend}\n"
         f"📊 RSI: {r:.1f}\n"
+        f"⚡ Momentum: {mom:+.2f}%\n"
+        f"📍 Position 24h: {pos:.0f}%\n"
         f"📦 Volume: {vol}\n"
+        f"📊 High 24h: {high24h} | Low: {low24h}\n"
+        f"━━━━━━━━━━━━━━━\n"
         f"💰 Margin: ${margin_1:.2f}\n"
         f"🔢 Leverage: {LEVERAGE}x\n"
         f"🧪 SIMULATION"
@@ -315,16 +375,14 @@ async def monitor_trade(session):
 
             if not trade["added"] and change >= ADD_THRESHOLD_PCT:
                 margin_2 = CAPITAL * ADD_ENTRY_PCT
-                size_2 = (margin_2 * LEVERAGE) / price
-                trade["current_size"] += size_2
                 trade["total_margin"] += margin_2
                 trade["added"] = True
                 msg = (
-                    f"➕ IMEONGEZA POSITION!\n"
+                    f"➕ IMEONGEZA!\n"
                     f"📊 {coin_name}\n"
                     f"💲 Bei: {price}\n"
-                    f"💰 Imeongeza: ${margin_2:.2f}\n"
-                    f"📈 Faida: {change*100:+.2f}%\n"
+                    f"💰 +${margin_2:.2f}\n"
+                    f"📈 {change*100:+.2f}%\n"
                     f"🧪 SIMULATION"
                 )
                 await send_telegram(session, msg)
@@ -385,15 +443,15 @@ async def scanner_loop(session):
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            await send_telegram(session, "🔍 Inatafuta coin nzuri...")
-            best_coin, signal, price, info = await scan_best_coin(session)
+            await send_telegram(session, "🔍 Inatafuta coin yenye momentum...")
+            best_coin, signal, price, info, tp, sl = await scan_best_coin(session)
 
             if not best_coin:
-                await send_telegram(session, "⏳ Hakuna signal nzuri sasa.\n🔄 Dakika 5...")
+                await send_telegram(session, "⏳ Hakuna momentum nzuri sasa.\n🔄 Dakika 5...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            await open_trade(session, best_coin, signal, price, info)
+            await open_trade(session, best_coin, signal, price, info, tp, sl)
             await asyncio.sleep(SCAN_INTERVAL)
 
         except Exception as e:
@@ -403,13 +461,15 @@ async def scanner_loop(session):
 async def main():
     async with aiohttp.ClientSession() as session:
         msg = (
-            f"⚡ OKX DUAL FUTURES BOT V2!\n"
+            f"⚡ OKX FUTURES BOT V3!\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💰 Capital: ${CAPITAL}\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
-            f"🎯 TP: {TP_PCT*100:.0f}% | SL: {SL_PCT*100:.1f}%\n"
+            f"🎯 TP: hadi 2% (ndani ya range 24h)\n"
+            f"🛑 SL: 1.2%\n"
             f"🧠 Trend: 1H | Signal: 15m\n"
-            f"📊 Entry: {FIRST_ENTRY_PCT*100:.0f}% + {ADD_ENTRY_PCT*100:.0f}%\n"
+            f"⚡ Momentum filter: ✅\n"
+            f"📍 Position 24h filter: ✅\n"
             f"🧪 SIMULATION"
         )
         log(msg)
