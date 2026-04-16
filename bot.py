@@ -3,6 +3,7 @@ import aiohttp
 import hmac
 import hashlib
 import base64
+import json
 import time
 from datetime import datetime, timezone
 
@@ -15,7 +16,8 @@ TELEGRAM_CHAT_ID = "7010983039"
 
 OKX_BASE = "https://www.okx.com"
 
-CAPITAL = 20.0
+DRY_RUN = False
+
 LEVERAGE = 5
 FIRST_ENTRY_PCT = 0.30
 ADD_ENTRY_PCT = 0.20
@@ -29,8 +31,15 @@ MAX_MOMENTUM_PCT = 8.0
 SCAN_INTERVAL = 300
 MONITOR_INTERVAL = 10
 
+MARGIN_GROWTH_THRESHOLD = 2.0
+MARGIN_GROWTH_PCT = 0.50
+
 active_trade = None
 stats = {"wins": 0, "losses": 0, "pnl": 0.0}
+
+base_capital = 0.0
+current_margin = 0.0
+last_double_at = 0.0
 
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
@@ -57,20 +66,87 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-async def get_ticker(session, inst_id):
+async def get_futures_balance(session):
     try:
-        path = f"/api/v5/market/ticker?instId={inst_id}"
-        async with session.get(OKX_BASE + path) as r:
+        path = "/api/v5/account/balance?ccy=USDT"
+        headers = get_headers("GET", path)
+        async with session.get(OKX_BASE + path, headers=headers) as r:
             data = await r.json()
-            t = data.get("data", [{}])[0]
-            return {
-                "price": float(t.get("last", 0)),
-                "high24h": float(t.get("high24h", 0)),
-                "low24h": float(t.get("low24h", 0)),
-                "vol_usd": float(t.get("volCcy24h", 0)) * float(t.get("last", 0))
-            }
-    except:
+            details = data.get("data", [{}])[0].get("details", [])
+            for d in details:
+                if d.get("ccy") == "USDT":
+                    return float(d.get("availBal", 0))
+        return 0.0
+    except Exception as e:
+        log(f"Balance error: {e}")
+        return 0.0
+
+async def set_leverage(session, inst_id):
+    if DRY_RUN:
+        return
+    try:
+        path = "/api/v5/account/set-leverage"
+        body = json.dumps({
+            "instId": inst_id,
+            "lever": str(LEVERAGE),
+            "mgnMode": "cross"
+        })
+        headers = get_headers("POST", path, body)
+        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
+            await r.json()
+    except Exception as e:
+        log(f"Leverage error: {e}")
+
+async def place_futures_order(session, inst_id, side, size):
+    if DRY_RUN:
+        log(f"[SIM] {side} {inst_id} size={size}")
+        return {"ordId": f"sim_{int(time.time())}"}
+    try:
+        path = "/api/v5/trade/order"
+        pos_side = "long" if side == "buy" else "short"
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "cross",
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "market",
+            "sz": str(size)
+        })
+        headers = get_headers("POST", path, body)
+        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
+            data = await r.json()
+            if data.get("code") == "0":
+                return data.get("data", [{}])[0]
+            else:
+                log(f"Order failed: {data.get('msg')}")
+                return None
+    except Exception as e:
+        log(f"Order error: {e}")
         return None
+
+async def close_futures_order(session, inst_id, signal):
+    if DRY_RUN:
+        return True
+    try:
+        path = "/api/v5/trade/order"
+        side = "sell" if signal == "LONG" else "buy"
+        pos_side = "long" if signal == "LONG" else "short"
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "cross",
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "market",
+            "sz": "0",
+            "reduceOnly": True
+        })
+        headers = get_headers("POST", path, body)
+        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
+            data = await r.json()
+            return data.get("code") == "0"
+    except Exception as e:
+        log(f"Close error: {e}")
+        return False
 
 async def get_all_futures(session):
     try:
@@ -145,10 +221,8 @@ def rsi(closes, period=14):
 def get_momentum(closes):
     if len(closes) < 6:
         return 0
-    recent = closes[-3:]
-    prev = closes[-6:-3]
-    avg_recent = sum(recent) / 3
-    avg_prev = sum(prev) / 3
+    avg_recent = sum(closes[-3:]) / 3
+    avg_prev = sum(closes[-6:-3]) / 3
     if avg_prev == 0:
         return 0
     return (avg_recent - avg_prev) / avg_prev * 100
@@ -168,75 +242,44 @@ def get_trend(closes_1h):
 def analyze(closes_15m, volumes, trend, high24h, low24h):
     if len(closes_15m) < 30:
         return "WAIT", {}
-
     price = closes_15m[-1]
     r = rsi(closes_15m)
     e9 = ema(closes_15m, 9)
     e21 = ema(closes_15m, 21)
     momentum = get_momentum(closes_15m)
     vol_ok = sum(volumes[-3:]) / 3 > sum(volumes[-8:-3]) / 5 * 1.2 if len(volumes) >= 8 else False
-
     range_24h = high24h - low24h
     price_position = (price - low24h) / range_24h * 100 if range_24h > 0 else 50
-
     info = {
-        "rsi": r,
-        "momentum": momentum,
+        "rsi": r, "momentum": momentum,
         "price_position": price_position,
-        "vol_ok": vol_ok,
-        "trend": trend,
-        "high24h": high24h,
-        "low24h": low24h,
-        "price": price
+        "vol_ok": vol_ok, "trend": trend,
+        "high24h": high24h, "low24h": low24h, "price": price
     }
-
     if trend == "UPTREND":
-        if (
-            30 < r < 60 and
-            e9 > e21 and
-            momentum > 0.3 and
-            price_position < 75 and
-            vol_ok
-        ):
+        if 30 < r < 60 and e9 > e21 and momentum > 0.3 and price_position < 75 and vol_ok:
             return "LONG", info
-
     elif trend == "DOWNTREND":
-        if (
-            40 < r < 70 and
-            e9 < e21 and
-            momentum < -0.3 and
-            price_position > 25 and
-            vol_ok
-        ):
+        if 40 < r < 70 and e9 < e21 and momentum < -0.3 and price_position > 25 and vol_ok:
             return "SHORT", info
-
     return "WAIT", info
 
-def calc_realistic_tp_sl(signal, price, high24h, low24h, trend):
-    range_24h = high24h - low24h
-
+def calc_tp_sl(signal, price, high24h, low24h):
     if signal == "LONG":
-        room_to_high = (high24h - price) / price
-        tp_pct = min(TP_PCT, room_to_high * 0.7)
+        room = (high24h - price) / price
+        tp_pct = min(TP_PCT, room * 0.7)
         if tp_pct < 0.008:
             return None, None
-        tp = round(price * (1 + tp_pct), 6)
-        sl = round(price * (1 - SL_PCT), 6)
-
+        return round(price * (1 + tp_pct), 6), round(price * (1 - SL_PCT), 6)
     else:
-        room_to_low = (price - low24h) / price
-        tp_pct = min(TP_PCT, room_to_low * 0.7)
+        room = (price - low24h) / price
+        tp_pct = min(TP_PCT, room * 0.7)
         if tp_pct < 0.008:
             return None, None
-        tp = round(price * (1 - tp_pct), 6)
-        sl = round(price * (1 + SL_PCT), 6)
-
-    return tp, sl
+        return round(price * (1 - tp_pct), 6), round(price * (1 + SL_PCT), 6)
 
 async def scan_best_coin(session):
-    log("🔍 Inascan coins kwa momentum ya sasa...")
     tickers = await get_all_futures(session)
-
     candidates = [
         t for t in tickers
         if t["vol_usd"] >= MIN_VOLUME_USD
@@ -244,71 +287,78 @@ async def scan_best_coin(session):
     ]
     candidates.sort(key=lambda x: x["vol_usd"], reverse=True)
 
-    best_coin = None
-    best_signal = "WAIT"
-    best_info = {}
-    best_tp = 0
-    best_sl = 0
-    best_price = 0
-
     for coin in candidates[:30]:
         inst_id = coin["instId"]
-
         closes_1h, _ = await get_candles(session, inst_id, "1H", 30)
         if not closes_1h:
             continue
-
         trend = get_trend(closes_1h)
         if trend == "SIDEWAYS":
             await asyncio.sleep(0.1)
             continue
-
         closes_15m, volumes_15m = await get_candles(session, inst_id, "15m", 60)
         if not closes_15m:
             continue
-
-        signal, info = analyze(
-            closes_15m, volumes_15m, trend,
-            coin["high24h"], coin["low24h"]
-        )
-
+        signal, info = analyze(closes_15m, volumes_15m, trend, coin["high24h"], coin["low24h"])
         if signal == "WAIT":
             await asyncio.sleep(0.1)
             continue
-
-        tp, sl = calc_realistic_tp_sl(
-            signal, coin["price"],
-            coin["high24h"], coin["low24h"], trend
-        )
-
+        tp, sl = calc_tp_sl(signal, coin["price"], coin["high24h"], coin["low24h"])
         if tp is None:
-            log(f"⏭️ {inst_id} — TP room ndogo sana, inaruka...")
             await asyncio.sleep(0.1)
             continue
-
-        log(f"✅ {inst_id} | {signal} | Trend:{trend} | RSI:{info['rsi']:.1f} | Mom:{info['momentum']:.2f}%")
-        best_coin = inst_id
-        best_signal = signal
-        best_info = info
-        best_tp = tp
-        best_sl = sl
-        best_price = coin["price"]
-        break
-
+        log(f"✅ {inst_id} | {signal} | Trend:{trend} | RSI:{info['rsi']:.1f}")
+        return inst_id, signal, coin["price"], info, tp, sl
         await asyncio.sleep(0.2)
 
-    return best_coin, best_signal, best_price, best_info, best_tp, best_sl
+    return None, "WAIT", 0, {}, 0, 0
+
+async def check_margin_growth(session):
+    global current_margin, last_double_at, base_capital
+
+    balance = await get_futures_balance(session)
+    if balance <= 0:
+        return
+
+    if last_double_at == 0:
+        last_double_at = base_capital
+
+    if balance >= last_double_at * MARGIN_GROWTH_THRESHOLD:
+        new_margin = current_margin * (1 + MARGIN_GROWTH_PCT)
+        old_margin = current_margin
+        current_margin = new_margin
+        last_double_at = balance
+
+        await send_telegram(session,
+            f"📈 MARGIN IMEONGEZWA!\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: ${balance:.4f} USDT\n"
+            f"📊 Margin zamani: ${old_margin:.2f}\n"
+            f"📊 Margin mpya: ${new_margin:.2f} (+{MARGIN_GROWTH_PCT*100:.0f}%)\n"
+            f"🎯 Itaongezwa tena balance ikiwa: ${balance * MARGIN_GROWTH_THRESHOLD:.2f}"
+        )
 
 async def open_trade(session, inst_id, signal, price, info, tp, sl):
     global active_trade
 
-    margin_1 = CAPITAL * FIRST_ENTRY_PCT
+    margin_1 = current_margin * FIRST_ENTRY_PCT
+    size = round((margin_1 * LEVERAGE) / price, 4)
+
+    await set_leverage(session, inst_id)
+
+    if not DRY_RUN:
+        side = "buy" if signal == "LONG" else "sell"
+        result = await place_futures_order(session, inst_id, side, size)
+        if not result:
+            log("Order imeshindwa!")
+            return
 
     active_trade = {
         "inst_id": inst_id,
         "signal": signal,
         "entry_price": price,
         "total_margin": margin_1,
+        "size": size,
         "tp_price": tp,
         "sl_price": sl,
         "entry_time": time.time(),
@@ -317,16 +367,9 @@ async def open_trade(session, inst_id, signal, price, info, tp, sl):
     }
 
     coin_name = inst_id.replace("-SWAP", "")
-    r = info.get("rsi", 0)
-    mom = info.get("momentum", 0)
-    pos = info.get("price_position", 0)
-    trend = info.get("trend", "")
-    vol = "✅" if info.get("vol_ok") else "❌"
-    high24h = info.get("high24h", 0)
-    low24h = info.get("low24h", 0)
-
     tp_pct = abs(tp - price) / price * 100
     sl_pct = abs(sl - price) / price * 100
+    mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
 
     msg = (
         f"🎯 IMEINGIA TRADE!\n"
@@ -337,16 +380,16 @@ async def open_trade(session, inst_id, signal, price, info, tp, sl):
         f"🎯 TP: {tp} (+{tp_pct:.1f}%)\n"
         f"🛑 SL: {sl} (-{sl_pct:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📈 Trend 1H: {trend}\n"
-        f"📊 RSI: {r:.1f}\n"
-        f"⚡ Momentum: {mom:+.2f}%\n"
-        f"📍 Position 24h: {pos:.0f}%\n"
-        f"📦 Volume: {vol}\n"
-        f"📊 High 24h: {high24h} | Low: {low24h}\n"
+        f"📈 Trend 1H: {info.get('trend')}\n"
+        f"📊 RSI: {info.get('rsi', 0):.1f}\n"
+        f"⚡ Momentum: {info.get('momentum', 0):+.2f}%\n"
+        f"📍 Position 24h: {info.get('price_position', 0):.0f}%\n"
+        f"📦 Volume: {'✅' if info.get('vol_ok') else '❌'}\n"
+        f"📊 High: {info.get('high24h')} | Low: {info.get('low24h')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"💰 Margin: ${margin_1:.2f}\n"
         f"🔢 Leverage: {LEVERAGE}x\n"
-        f"🧪 SIMULATION"
+        f"⚡ {mode}"
     )
     log(msg)
     await send_telegram(session, msg)
@@ -374,16 +417,21 @@ async def monitor_trade(session):
                 change = (trade["entry_price"] - price) / trade["entry_price"]
 
             if not trade["added"] and change >= ADD_THRESHOLD_PCT:
-                margin_2 = CAPITAL * ADD_ENTRY_PCT
+                margin_2 = current_margin * ADD_ENTRY_PCT
+                size_2 = round((margin_2 * LEVERAGE) / price, 4)
+                if not DRY_RUN:
+                    side = "buy" if trade["signal"] == "LONG" else "sell"
+                    await place_futures_order(session, trade["inst_id"], side, size_2)
                 trade["total_margin"] += margin_2
                 trade["added"] = True
+                mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
                 msg = (
-                    f"➕ IMEONGEZA!\n"
+                    f"➕ IMEONGEZA POSITION!\n"
                     f"📊 {coin_name}\n"
                     f"💲 Bei: {price}\n"
                     f"💰 +${margin_2:.2f}\n"
                     f"📈 {change*100:+.2f}%\n"
-                    f"🧪 SIMULATION"
+                    f"⚡ {mode}"
                 )
                 await send_telegram(session, msg)
 
@@ -393,6 +441,9 @@ async def monitor_trade(session):
                      (trade["signal"] == "SHORT" and price >= trade["sl_price"])
 
             if tp_hit or sl_hit:
+                if not DRY_RUN:
+                    await close_futures_order(session, trade["inst_id"], trade["signal"])
+
                 trade["closed"] = True
                 pnl = change * trade["total_margin"] * LEVERAGE
                 hold = (time.time() - trade["entry_time"]) / 60
@@ -406,6 +457,8 @@ async def monitor_trade(session):
 
                 stats["pnl"] += pnl
                 win_rate = (stats["wins"] / max(stats["wins"] + stats["losses"], 1)) * 100
+                balance = await get_futures_balance(session)
+                mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
 
                 msg = (
                     f"{emoji}\n"
@@ -418,13 +471,16 @@ async def monitor_trade(session):
                     f"━━━━━━━━━━━━━━━\n"
                     f"💵 PnL: {'+' if pnl >= 0 else ''}{pnl:.3f} USDT\n"
                     f"📊 Jumla: {stats['pnl']:+.3f} USDT\n"
+                    f"💰 Balance: ${balance:.4f} USDT\n"
                     f"🏆 Win Rate: {win_rate:.0f}%\n"
                     f"✅ {stats['wins']} | ❌ {stats['losses']}\n"
-                    f"🧪 SIMULATION"
+                    f"⚡ {mode}"
                 )
                 log(msg)
                 await send_telegram(session, msg)
                 active_trade = None
+
+                await check_margin_growth(session)
 
             await asyncio.sleep(MONITOR_INTERVAL)
 
@@ -443,11 +499,11 @@ async def scanner_loop(session):
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            await send_telegram(session, "🔍 Inatafuta coin yenye momentum...")
+            log("🔍 Inascan...")
             best_coin, signal, price, info, tp, sl = await scan_best_coin(session)
 
             if not best_coin:
-                await send_telegram(session, "⏳ Hakuna momentum nzuri sasa.\n🔄 Dakika 5...")
+                log("Hakuna signal — inasubiri...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
@@ -459,18 +515,26 @@ async def scanner_loop(session):
             await asyncio.sleep(30)
 
 async def main():
+    global base_capital, current_margin, last_double_at
+
     async with aiohttp.ClientSession() as session:
+        balance = await get_futures_balance(session)
+        base_capital = balance
+        current_margin = balance
+        last_double_at = balance
+
+        mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
+        double_at = balance * MARGIN_GROWTH_THRESHOLD
+
         msg = (
-            f"⚡ OKX FUTURES BOT V3!\n"
+            f"⚡ OKX FUTURES BOT V3 LIVE!\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"💰 Capital: ${CAPITAL}\n"
+            f"💰 Balance: ${balance:.4f} USDT\n"
+            f"📊 Margin ya kwanza: ${current_margin:.4f}\n"
             f"🔢 Leverage: {LEVERAGE}x\n"
-            f"🎯 TP: hadi 2% (ndani ya range 24h)\n"
-            f"🛑 SL: 1.2%\n"
-            f"🧠 Trend: 1H | Signal: 15m\n"
-            f"⚡ Momentum filter: ✅\n"
-            f"📍 Position 24h filter: ✅\n"
-            f"🧪 SIMULATION"
+            f"🎯 TP: hadi 2% | SL: 1.2%\n"
+            f"📈 Margin itaongezwa balance ikiwa: ${double_at:.2f}\n"
+            f"⚡ Mode: {mode}"
         )
         log(msg)
         await send_telegram(session, msg)
