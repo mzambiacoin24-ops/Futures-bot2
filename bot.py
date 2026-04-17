@@ -36,7 +36,6 @@ MARGIN_GROWTH_PCT = 0.50
 
 active_trade = None
 stats = {"wins": 0, "losses": 0, "pnl": 0.0}
-
 base_capital = 0.0
 current_margin = 0.0
 last_double_at = 0.0
@@ -66,6 +65,34 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
+async def set_position_mode(session):
+    """Weka account kwenye long_short_mode ili posSide ifanye kazi"""
+    try:
+        path = "/api/v5/account/set-position-mode"
+        body = json.dumps({"posMode": "long_short_mode"})
+        headers = get_headers("POST", path, body)
+        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
+            data = await r.json()
+            if data.get("code") == "0":
+                log("✅ Position mode: long_short_mode")
+            else:
+                log(f"Position mode: {data.get('msg')} (inaweza tayari kuwa imewekwa)")
+    except Exception as e:
+        log(f"Position mode error: {e}")
+
+async def get_instrument_info(session, inst_id):
+    """Pata minimum size ya coin"""
+    try:
+        path = f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}"
+        async with session.get(OKX_BASE + path) as r:
+            data = await r.json()
+            inst = data.get("data", [{}])[0]
+            min_sz = float(inst.get("minSz", 1))
+            ct_val = float(inst.get("ctVal", 1))
+            return min_sz, ct_val
+    except:
+        return 1, 1
+
 async def get_futures_balance(session):
     try:
         path = "/api/v5/account/balance?ccy=USDT"
@@ -81,64 +108,67 @@ async def get_futures_balance(session):
         log(f"Balance error: {e}")
         return 0.0
 
-async def set_leverage(session, inst_id):
-    if DRY_RUN:
-        return
+async def set_leverage(session, inst_id, pos_side):
     try:
         path = "/api/v5/account/set-leverage"
         body = json.dumps({
             "instId": inst_id,
             "lever": str(LEVERAGE),
-            "mgnMode": "cross"
-        })
-        headers = get_headers("POST", path, body)
-        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
-            await r.json()
-    except Exception as e:
-        log(f"Leverage error: {e}")
-
-async def place_futures_order(session, inst_id, side, size):
-    if DRY_RUN:
-        log(f"[SIM] {side} {inst_id} size={size}")
-        return {"ordId": f"sim_{int(time.time())}"}
-    try:
-        path = "/api/v5/trade/order"
-        pos_side = "long" if side == "buy" else "short"
-        body = json.dumps({
-            "instId": inst_id,
-            "tdMode": "cross",
-            "side": side,
-            "posSide": pos_side,
-            "ordType": "market",
-            "sz": str(size)
+            "mgnMode": "isolated",
+            "posSide": pos_side
         })
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
             data = await r.json()
             if data.get("code") == "0":
-                return data.get("data", [{}])[0]
+                log(f"✅ Leverage {LEVERAGE}x imewekwa: {inst_id} {pos_side}")
             else:
-                log(f"Order failed: {data.get('msg')}")
+                log(f"Leverage warning: {data.get('msg')}")
+    except Exception as e:
+        log(f"Leverage error: {e}")
+
+async def place_order(session, inst_id, side, pos_side, size):
+    if DRY_RUN:
+        log(f"[SIM] {side} {inst_id} sz={size} posSide={pos_side}")
+        return {"ordId": f"sim_{int(time.time())}"}
+    try:
+        path = "/api/v5/trade/order"
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "isolated",
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "market",
+            "sz": str(size),
+            "clOrdId": f"bot{int(time.time())}"
+        })
+        headers = get_headers("POST", path, body)
+        async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
+            data = await r.json()
+            if data.get("code") == "0":
+                result = data.get("data", [{}])[0]
+                if result.get("sCode") == "0":
+                    log(f"✅ Order imefanikiwa: {result.get('ordId')}")
+                    return result
+                else:
+                    log(f"Order failed: {result.get('sMsg')}")
+                    return None
+            else:
+                log(f"Order error: {data.get('msg')}")
                 return None
     except Exception as e:
         log(f"Order error: {e}")
         return None
 
-async def close_futures_order(session, inst_id, signal):
+async def close_position(session, inst_id, pos_side):
     if DRY_RUN:
         return True
     try:
-        path = "/api/v5/trade/order"
-        side = "sell" if signal == "LONG" else "buy"
-        pos_side = "long" if signal == "LONG" else "short"
+        path = "/api/v5/trade/close-position"
         body = json.dumps({
             "instId": inst_id,
-            "tdMode": "cross",
-            "side": side,
-            "posSide": pos_side,
-            "ordType": "market",
-            "sz": "0",
-            "reduceOnly": True
+            "mgnMode": "isolated",
+            "posSide": pos_side
         })
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
@@ -313,49 +343,28 @@ async def scan_best_coin(session):
 
     return None, "WAIT", 0, {}, 0, 0
 
-async def check_margin_growth(session):
-    global current_margin, last_double_at, base_capital
-
-    balance = await get_futures_balance(session)
-    if balance <= 0:
-        return
-
-    if last_double_at == 0:
-        last_double_at = base_capital
-
-    if balance >= last_double_at * MARGIN_GROWTH_THRESHOLD:
-        new_margin = current_margin * (1 + MARGIN_GROWTH_PCT)
-        old_margin = current_margin
-        current_margin = new_margin
-        last_double_at = balance
-
-        await send_telegram(session,
-            f"📈 MARGIN IMEONGEZWA!\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"💰 Balance: ${balance:.4f} USDT\n"
-            f"📊 Margin zamani: ${old_margin:.2f}\n"
-            f"📊 Margin mpya: ${new_margin:.2f} (+{MARGIN_GROWTH_PCT*100:.0f}%)\n"
-            f"🎯 Itaongezwa tena balance ikiwa: ${balance * MARGIN_GROWTH_THRESHOLD:.2f}"
-        )
-
 async def open_trade(session, inst_id, signal, price, info, tp, sl):
     global active_trade
 
     margin_1 = current_margin * FIRST_ENTRY_PCT
-    size = round((margin_1 * LEVERAGE) / price, 4)
+    min_sz, ct_val = await get_instrument_info(session, inst_id)
+    size = max(round((margin_1 * LEVERAGE) / (price * ct_val), 0), min_sz)
 
-    await set_leverage(session, inst_id)
+    pos_side = "long" if signal == "LONG" else "short"
+    side = "buy" if signal == "LONG" else "sell"
+
+    await set_leverage(session, inst_id, pos_side)
 
     if not DRY_RUN:
-        side = "buy" if signal == "LONG" else "sell"
-        result = await place_futures_order(session, inst_id, side, size)
+        result = await place_order(session, inst_id, side, pos_side, int(size))
         if not result:
-            log("Order imeshindwa!")
+            log("Order imeshindwa — inaruka trade hii")
             return
 
     active_trade = {
         "inst_id": inst_id,
         "signal": signal,
+        "pos_side": pos_side,
         "entry_price": price,
         "total_margin": margin_1,
         "size": size,
@@ -418,14 +427,15 @@ async def monitor_trade(session):
 
             if not trade["added"] and change >= ADD_THRESHOLD_PCT:
                 margin_2 = current_margin * ADD_ENTRY_PCT
-                size_2 = round((margin_2 * LEVERAGE) / price, 4)
+                min_sz, ct_val = await get_instrument_info(session, trade["inst_id"])
+                size_2 = max(round((margin_2 * LEVERAGE) / (price * ct_val), 0), min_sz)
                 if not DRY_RUN:
                     side = "buy" if trade["signal"] == "LONG" else "sell"
-                    await place_futures_order(session, trade["inst_id"], side, size_2)
+                    await place_order(session, trade["inst_id"], side, trade["pos_side"], int(size_2))
                 trade["total_margin"] += margin_2
                 trade["added"] = True
                 mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-                msg = (
+                await send_telegram(session,
                     f"➕ IMEONGEZA POSITION!\n"
                     f"📊 {coin_name}\n"
                     f"💲 Bei: {price}\n"
@@ -433,7 +443,6 @@ async def monitor_trade(session):
                     f"📈 {change*100:+.2f}%\n"
                     f"⚡ {mode}"
                 )
-                await send_telegram(session, msg)
 
             tp_hit = (trade["signal"] == "LONG" and price >= trade["tp_price"]) or \
                      (trade["signal"] == "SHORT" and price <= trade["tp_price"])
@@ -442,7 +451,7 @@ async def monitor_trade(session):
 
             if tp_hit or sl_hit:
                 if not DRY_RUN:
-                    await close_futures_order(session, trade["inst_id"], trade["signal"])
+                    await close_position(session, trade["inst_id"], trade["pos_side"])
 
                 trade["closed"] = True
                 pnl = change * trade["total_margin"] * LEVERAGE
@@ -479,7 +488,6 @@ async def monitor_trade(session):
                 log(msg)
                 await send_telegram(session, msg)
                 active_trade = None
-
                 await check_margin_growth(session)
 
             await asyncio.sleep(MONITOR_INTERVAL)
@@ -487,6 +495,27 @@ async def monitor_trade(session):
         except Exception as e:
             log(f"Monitor error: {e}")
             await asyncio.sleep(MONITOR_INTERVAL)
+
+async def check_margin_growth(session):
+    global current_margin, last_double_at
+
+    balance = await get_futures_balance(session)
+    if balance <= 0:
+        return
+
+    if balance >= last_double_at * MARGIN_GROWTH_THRESHOLD:
+        old_margin = current_margin
+        current_margin = current_margin * (1 + MARGIN_GROWTH_PCT)
+        last_double_at = balance
+
+        await send_telegram(session,
+            f"📈 MARGIN IMEONGEZWA!\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: ${balance:.4f} USDT\n"
+            f"📊 Zamani: ${old_margin:.2f}\n"
+            f"📊 Mpya: ${current_margin:.2f}\n"
+            f"🎯 Itaongezwa tena: ${balance * MARGIN_GROWTH_THRESHOLD:.2f}"
+        )
 
 async def scanner_loop(session):
     global active_trade
@@ -500,7 +529,8 @@ async def scanner_loop(session):
                 continue
 
             log("🔍 Inascan...")
-            best_coin, signal, price, info, tp, sl = await scan_best_coin(session)
+            result = await scan_best_coin(session)
+            best_coin, signal, price, info, tp, sl = result
 
             if not best_coin:
                 log("Hakuna signal — inasubiri...")
@@ -518,22 +548,23 @@ async def main():
     global base_capital, current_margin, last_double_at
 
     async with aiohttp.ClientSession() as session:
+        await set_position_mode(session)
+
         balance = await get_futures_balance(session)
         base_capital = balance
         current_margin = balance
         last_double_at = balance
 
         mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-        double_at = balance * MARGIN_GROWTH_THRESHOLD
 
         msg = (
             f"⚡ OKX FUTURES BOT V3 LIVE!\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💰 Balance: ${balance:.4f} USDT\n"
-            f"📊 Margin ya kwanza: ${current_margin:.4f}\n"
-            f"🔢 Leverage: {LEVERAGE}x\n"
+            f"📊 Margin: ${current_margin:.4f}\n"
+            f"🔢 Leverage: {LEVERAGE}x | Isolated\n"
             f"🎯 TP: hadi 2% | SL: 1.2%\n"
-            f"📈 Margin itaongezwa balance ikiwa: ${double_at:.2f}\n"
+            f"📈 Margin itaongezwa: ${balance * MARGIN_GROWTH_THRESHOLD:.2f}\n"
             f"⚡ Mode: {mode}"
         )
         log(msg)
