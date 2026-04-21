@@ -21,7 +21,7 @@ ADD_ENTRY_PCT = 0.10
 ADD_THRESHOLD_PCT = 0.02
 
 OKX_FEE = 0.0005 * 2
-TP_PCT = 0.03
+TP_LEVELS = [0.015, 0.02, 0.025, 0.03]
 SL_PCT = 0.025
 
 # Punguza overtrade — subiri dakika 90 kati ya trades
@@ -391,11 +391,12 @@ async def open_trade(session, inst_id, signal, price, info):
             log("Order imeshindwa")
             return
 
+    tp_pct = TP_LEVELS[0]
     if signal == "LONG":
-        tp = round(price * (1 + TP_PCT), 6)
+        tp = round(price * (1 + tp_pct), 6)
         sl = round(price * (1 - SL_PCT), 6)
     else:
-        tp = round(price * (1 - TP_PCT), 6)
+        tp = round(price * (1 - tp_pct), 6)
         sl = round(price * (1 + SL_PCT), 6)
 
     active_trade = {
@@ -407,6 +408,7 @@ async def open_trade(session, inst_id, signal, price, info):
         "position_size": position_size,
         "tp_price": tp,
         "sl_price": sl,
+        "tp_idx": 0,
         "entry_time": time.time(),
         "added": False,
         "closed": False,
@@ -420,11 +422,8 @@ async def open_trade(session, inst_id, signal, price, info):
         last_trade_day = today
     trades_today += 1
 
-    coin_name = inst_id.replace("-SWAP", "")
-    score = info.get("score", 0)
-    tp_pct = abs(tp - price) / price * 100
-    sl_pct = abs(sl - price) / price * 100
-    net_tp = (TP_PCT - OKX_FEE) * position_size
+    tp_pct = TP_LEVELS[0]
+    net_tp = (TP_LEVELS[-1] - OKX_FEE) * position_size
     net_sl = (SL_PCT + OKX_FEE) * position_size
     mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
 
@@ -434,12 +433,11 @@ async def open_trade(session, inst_id, signal, price, info):
         f"📊 {coin_name}\n"
         f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
         f"💲 Entry: {price}\n"
-        f"🎯 TP: {tp} (+{tp_pct:.2f}%)\n"
-        f"🛑 SL: {sl} (-{sl_pct:.2f}%)\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"✅ Net faida ikiTP: +${net_tp:.4f}\n"
-        f"❌ Net hasara ikiSL: -${net_sl:.4f}\n"
-        f"📊 Ratio: {net_tp/net_sl:.1f}:1\n"
+        f"🎯 TP1: {round(price*(1+TP_LEVELS[0]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[0]),6)} (+{TP_LEVELS[0]*100:.1f}%)\n"
+        f"🎯 TP2: {round(price*(1+TP_LEVELS[1]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[1]),6)} (+{TP_LEVELS[1]*100:.1f}%)\n"
+        f"🎯 TP3: {round(price*(1+TP_LEVELS[2]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[2]),6)} (+{TP_LEVELS[2]*100:.1f}%)\n"
+        f"🎯 TP4: {round(price*(1+TP_LEVELS[3]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[3]),6)} (+{TP_LEVELS[3]*100:.1f}%)\n"
+        f"🛑 SL: {sl} (-{SL_PCT*100:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 RSI: {info.get('rsi', 0):.1f}\n"
         f"📈 EMA50: {info.get('e50', 0):.4f}\n"
@@ -507,6 +505,39 @@ async def monitor_trade(session):
             sl_hit = (trade["signal"] == "LONG" and price <= trade["sl_price"]) or \
                      (trade["signal"] == "SHORT" and price >= trade["sl_price"])
 
+            # TP imefikiwa — weka trailing stop hapo, subiri TP inayofuata
+            if tp_hit and trade["tp_idx"] < len(TP_LEVELS) - 1:
+                next_idx = trade["tp_idx"] + 1
+                next_tp_pct = TP_LEVELS[next_idx]
+                entry = trade["entry_price"]
+
+                # Weka trailing stop kwenye TP iliyofikiwa (lock faida)
+                current_tp_pct = TP_LEVELS[trade["tp_idx"]]
+                if trade["signal"] == "LONG":
+                    new_tp = round(entry * (1 + next_tp_pct), 6)
+                    new_sl = round(entry * (1 + current_tp_pct * 0.5), 6)
+                else:
+                    new_tp = round(entry * (1 - next_tp_pct), 6)
+                    new_sl = round(entry * (1 - current_tp_pct * 0.5), 6)
+
+                trade["tp_price"] = new_tp
+                trade["sl_price"] = new_sl
+                trade["tp_idx"] = next_idx
+                coin_name2 = trade["inst_id"].replace("-SWAP", "")
+                mode2 = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
+                await send_telegram(session,
+                    f"📈 TP{trade['tp_idx']} IMEFIKIWA!\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📊 {coin_name2}\n"
+                    f"✅ TP {current_tp_pct*100:.1f}% imefikiwa\n"
+                    f"🎯 TP inayofuata: {new_tp} (+{next_tp_pct*100:.1f}%)\n"
+                    f"🛡️ SL imehamia: {new_sl} (faida imelindwa)\n"
+                    f"📈 Faida sasa: {change*100:+.2f}%\n"
+                    f"⚡ {mode2}"
+                )
+                await asyncio.sleep(MONITOR_INTERVAL)
+                continue
+
             if tp_hit or sl_hit:
                 if not DRY_RUN:
                     await close_position(session, trade["inst_id"], trade["pos_side"])
@@ -519,7 +550,8 @@ async def monitor_trade(session):
 
                 if net > 0:
                     stats["wins"] += 1
-                    emoji = "💰 TAKE PROFIT!"
+                    tp_level_reached = TP_LEVELS[trade["tp_idx"]] * 100
+                    emoji = f"💰 TAKE PROFIT! (+{tp_level_reached:.1f}%)"
                 else:
                     stats["losses"] += 1
                     emoji = "🛑 STOP LOSS!"
