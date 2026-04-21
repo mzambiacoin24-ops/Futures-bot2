@@ -19,22 +19,17 @@ LEVERAGE = 5
 FIRST_ENTRY_PCT = 0.10
 ADD_ENTRY_PCT = 0.10
 ADD_THRESHOLD_PCT = 0.02
-
 OKX_FEE = 0.0005 * 2
 TP_LEVELS = [0.015, 0.02, 0.025, 0.03]
 SL_PCT = 0.025
-
-# Punguza overtrade — subiri dakika 90 kati ya trades
 MIN_WAIT_BETWEEN_TRADES = 90 * 60
 MAX_TRADES_PER_DAY = 15
-
 MIN_SCORE = 6
 MIN_VOLUME_USD = 2_000_000
 MIN_CHANGE_PCT = 1.5
 MAX_CHANGE_PCT = 10.0
 SCAN_INTERVAL = 600
 MONITOR_INTERVAL = 15
-
 MARGIN_GROWTH_X = 2.0
 MARGIN_GROWTH_PCT = 0.50
 
@@ -60,7 +55,9 @@ async def send_telegram(session, msg):
 def get_headers(method, path, body=""):
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     msg = ts + method.upper() + path + body
-    sig = base64.b64encode(hmac.new(OKX_SECRET.encode(), msg.encode(), hashlib.sha256).digest()).decode()
+    sig = base64.b64encode(
+        hmac.new(OKX_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
+    ).decode()
     return {
         "OK-ACCESS-KEY": OKX_API_KEY,
         "OK-ACCESS-SIGN": sig,
@@ -284,9 +281,8 @@ def analyze(opens, highs, lows, closes, volumes, high24h, low24h):
 
     momentum = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
 
-    # Angalia candle 3 zilizopita zinaelekea upande gani
-    consecutive_up = all(closes[-i] > closes[-i-1] for i in range(1, 3))
-    consecutive_down = all(closes[-i] < closes[-i-1] for i in range(1, 3))
+    consecutive_up = len(closes) >= 3 and all(closes[-i] > closes[-i-1] for i in range(1, 3))
+    consecutive_down = len(closes) >= 3 and all(closes[-i] < closes[-i-1] for i in range(1, 3))
 
     info = {
         "rsi": r, "e50": e50, "e200": e200,
@@ -295,7 +291,6 @@ def analyze(opens, highs, lows, closes, volumes, high24h, low24h):
         "high24h": high24h, "low24h": low24h, "price": price
     }
 
-    # LONG: RSI > 50, EMA50 > EMA200
     if r > 50 and e50 > e200:
         score = sum([
             r > 50,
@@ -315,7 +310,6 @@ def analyze(opens, highs, lows, closes, volumes, high24h, low24h):
                 return "WAIT", info
             return "LONG", info
 
-    # SHORT: RSI < 50, EMA50 < EMA200
     if r < 50 and e50 < e200:
         score = sum([
             r < 50,
@@ -347,19 +341,16 @@ async def scan_best_coin(session):
     candidates.sort(key=lambda x: x["vol_usd"], reverse=True)
 
     best_candidates = []
-
     for coin in candidates[:40]:
         inst_id = coin["instId"]
         opens, highs, lows, closes, volumes = await get_candles(session, inst_id, "15m", 220)
         if len(closes) < 210:
             await asyncio.sleep(0.1)
             continue
-
         signal, info = analyze(opens, highs, lows, closes, volumes, coin["high24h"], coin["low24h"])
         if signal == "WAIT":
             await asyncio.sleep(0.1)
             continue
-
         score = info.get("score", 0)
         log(f"✅ {inst_id} | {signal} | RSI:{info['rsi']:.1f} | Score:{score}/8")
         best_candidates.append((score, inst_id, signal, coin["price"], info))
@@ -391,13 +382,21 @@ async def open_trade(session, inst_id, signal, price, info):
             log("Order imeshindwa")
             return
 
-    tp_pct = TP_LEVELS[0]
+    first_tp_pct = TP_LEVELS[0]
     if signal == "LONG":
-        tp = round(price * (1 + tp_pct), 6)
+        tp = round(price * (1 + first_tp_pct), 6)
         sl = round(price * (1 - SL_PCT), 6)
+        tp1 = round(price * (1 + TP_LEVELS[0]), 6)
+        tp2 = round(price * (1 + TP_LEVELS[1]), 6)
+        tp3 = round(price * (1 + TP_LEVELS[2]), 6)
+        tp4 = round(price * (1 + TP_LEVELS[3]), 6)
     else:
-        tp = round(price * (1 - tp_pct), 6)
+        tp = round(price * (1 - first_tp_pct), 6)
         sl = round(price * (1 + SL_PCT), 6)
+        tp1 = round(price * (1 - TP_LEVELS[0]), 6)
+        tp2 = round(price * (1 - TP_LEVELS[1]), 6)
+        tp3 = round(price * (1 - TP_LEVELS[2]), 6)
+        tp4 = round(price * (1 - TP_LEVELS[3]), 6)
 
     active_trade = {
         "inst_id": inst_id,
@@ -422,9 +421,8 @@ async def open_trade(session, inst_id, signal, price, info):
         last_trade_day = today
     trades_today += 1
 
-    tp_pct = TP_LEVELS[0]
-    net_tp = (TP_LEVELS[-1] - OKX_FEE) * position_size
-    net_sl = (SL_PCT + OKX_FEE) * position_size
+    coin_name = inst_id.replace("-SWAP", "")
+    score = info.get("score", 0)
     mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
 
     msg = (
@@ -433,10 +431,11 @@ async def open_trade(session, inst_id, signal, price, info):
         f"📊 {coin_name}\n"
         f"{'🟢 LONG' if signal == 'LONG' else '🔴 SHORT'}\n"
         f"💲 Entry: {price}\n"
-        f"🎯 TP1: {round(price*(1+TP_LEVELS[0]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[0]),6)} (+{TP_LEVELS[0]*100:.1f}%)\n"
-        f"🎯 TP2: {round(price*(1+TP_LEVELS[1]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[1]),6)} (+{TP_LEVELS[1]*100:.1f}%)\n"
-        f"🎯 TP3: {round(price*(1+TP_LEVELS[2]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[2]),6)} (+{TP_LEVELS[2]*100:.1f}%)\n"
-        f"🎯 TP4: {round(price*(1+TP_LEVELS[3]),6) if signal=='LONG' else round(price*(1-TP_LEVELS[3]),6)} (+{TP_LEVELS[3]*100:.1f}%)\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🎯 TP1: {tp1} (+{TP_LEVELS[0]*100:.1f}%)\n"
+        f"🎯 TP2: {tp2} (+{TP_LEVELS[1]*100:.1f}%)\n"
+        f"🎯 TP3: {tp3} (+{TP_LEVELS[2]*100:.1f}%)\n"
+        f"🎯 TP4: {tp4} (+{TP_LEVELS[3]*100:.1f}%)\n"
         f"🛑 SL: {sl} (-{SL_PCT*100:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 RSI: {info.get('rsi', 0):.1f}\n"
@@ -478,6 +477,7 @@ async def monitor_trade(session):
             else:
                 change = (trade["entry_price"] - price) / trade["entry_price"]
 
+            # Ongeza position ikiendelea vizuri
             if not trade["added"] and change >= ADD_THRESHOLD_PCT:
                 margin_2 = current_margin * ADD_ENTRY_PCT
                 position_2 = margin_2 * LEVERAGE
@@ -490,29 +490,32 @@ async def monitor_trade(session):
                 trade["position_size"] += position_2
                 trade["fee_est"] += position_2 * OKX_FEE
                 trade["added"] = True
-                mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
+                mode2 = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
                 await send_telegram(session,
                     f"➕ IMEONGEZA!\n"
                     f"📊 {coin_name}\n"
                     f"💲 Bei: {price}\n"
                     f"💰 +${margin_2:.2f} (10% zaidi)\n"
                     f"📈 {change*100:+.2f}%\n"
-                    f"⚡ {mode}"
+                    f"⚡ {mode2}"
                 )
 
-            tp_hit = (trade["signal"] == "LONG" and price >= trade["tp_price"]) or \
-                     (trade["signal"] == "SHORT" and price <= trade["tp_price"])
-            sl_hit = (trade["signal"] == "LONG" and price <= trade["sl_price"]) or \
-                     (trade["signal"] == "SHORT" and price >= trade["sl_price"])
+            tp_hit = (
+                (trade["signal"] == "LONG" and price >= trade["tp_price"]) or
+                (trade["signal"] == "SHORT" and price <= trade["tp_price"])
+            )
+            sl_hit = (
+                (trade["signal"] == "LONG" and price <= trade["sl_price"]) or
+                (trade["signal"] == "SHORT" and price >= trade["sl_price"])
+            )
 
-            # TP imefikiwa — weka trailing stop hapo, subiri TP inayofuata
+            # TP imefikiwa na bado kuna level nyingine — hamisha SL, subiri TP inayofuata
             if tp_hit and trade["tp_idx"] < len(TP_LEVELS) - 1:
+                current_tp_pct = TP_LEVELS[trade["tp_idx"]]
                 next_idx = trade["tp_idx"] + 1
                 next_tp_pct = TP_LEVELS[next_idx]
                 entry = trade["entry_price"]
 
-                # Weka trailing stop kwenye TP iliyofikiwa (lock faida)
-                current_tp_pct = TP_LEVELS[trade["tp_idx"]]
                 if trade["signal"] == "LONG":
                     new_tp = round(entry * (1 + next_tp_pct), 6)
                     new_sl = round(entry * (1 + current_tp_pct * 0.5), 6)
@@ -523,21 +526,22 @@ async def monitor_trade(session):
                 trade["tp_price"] = new_tp
                 trade["sl_price"] = new_sl
                 trade["tp_idx"] = next_idx
-                coin_name2 = trade["inst_id"].replace("-SWAP", "")
+
                 mode2 = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
                 await send_telegram(session,
-                    f"📈 TP{trade['tp_idx']} IMEFIKIWA!\n"
+                    f"📈 TP{next_idx} IMEFIKIWA!\n"
                     f"━━━━━━━━━━━━━━━\n"
-                    f"📊 {coin_name2}\n"
+                    f"📊 {coin_name}\n"
                     f"✅ TP {current_tp_pct*100:.1f}% imefikiwa\n"
                     f"🎯 TP inayofuata: {new_tp} (+{next_tp_pct*100:.1f}%)\n"
-                    f"🛡️ SL imehamia: {new_sl} (faida imelindwa)\n"
+                    f"🛡️ SL imehamia: {new_sl} (faida imelindwa!)\n"
                     f"📈 Faida sasa: {change*100:+.2f}%\n"
                     f"⚡ {mode2}"
                 )
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
+            # TP4 au SL — funga trade
             if tp_hit or sl_hit:
                 if not DRY_RUN:
                     await close_position(session, trade["inst_id"], trade["pos_side"])
@@ -547,10 +551,10 @@ async def monitor_trade(session):
                 fees = trade["fee_est"]
                 net = gross - fees
                 hold = (time.time() - trade["entry_time"]) / 60
+                tp_level_reached = TP_LEVELS[trade["tp_idx"]] * 100
 
                 if net > 0:
                     stats["wins"] += 1
-                    tp_level_reached = TP_LEVELS[trade["tp_idx"]] * 100
                     emoji = f"💰 TAKE PROFIT! (+{tp_level_reached:.1f}%)"
                 else:
                     stats["losses"] += 1
@@ -614,7 +618,6 @@ async def scanner_loop(session):
 
     while True:
         try:
-            # Angalia limit ya trades kwa siku
             today = datetime.now().strftime("%Y-%m-%d")
             if last_trade_day != today:
                 trades_today = 0
@@ -626,15 +629,14 @@ async def scanner_loop(session):
                 continue
 
             if trades_today >= MAX_TRADES_PER_DAY:
-                log(f"🛑 Limit ya leo imefikiwa: {trades_today} trades")
+                log(f"🛑 Limit ya leo: {trades_today}/{MAX_TRADES_PER_DAY}")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            # Subiri kati ya trades
             elapsed = time.time() - last_trade_time
             if last_trade_time > 0 and elapsed < MIN_WAIT_BETWEEN_TRADES:
                 wait_left = int((MIN_WAIT_BETWEEN_TRADES - elapsed) / 60)
-                log(f"⏳ Inasubiri dakika {wait_left} kati ya trades...")
+                log(f"⏳ Inasubiri dakika {wait_left}...")
                 await asyncio.sleep(60)
                 continue
 
@@ -642,7 +644,7 @@ async def scanner_loop(session):
             inst_id, signal, price, info = await scan_best_coin(session)
 
             if not inst_id:
-                log("Hakuna signal nzuri — inasubiri...")
+                log("Hakuna signal — inasubiri...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
@@ -662,19 +664,19 @@ async def main():
         current_margin = balance
         last_double_at = balance
 
-        net_tp = (TP_PCT - OKX_FEE) * 100
-        net_sl = (SL_PCT + OKX_FEE) * 100
         mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-
         msg = (
-            f"⚡ OKX FUTURES — SMART & SLOW!\n"
+            f"⚡ OKX FUTURES BOT!\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💰 Balance: ${balance:.4f} USDT\n"
             f"🔢 Leverage: {LEVERAGE}x | Isolated\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🎯 TP: +3% → Net: +{net_tp:.1f}%\n"
-            f"🛑 SL: -2.5% → Net: -{net_sl:.1f}%\n"
-            f"📊 Ratio: {net_tp/net_sl:.1f}:1\n"
+            f"🎯 Progressive TP:\n"
+            f"  TP1: +1.5% → SL inahamia\n"
+            f"  TP2: +2.0% → SL inahamia\n"
+            f"  TP3: +2.5% → SL inahamia\n"
+            f"  TP4: +3.0% → EXIT\n"
+            f"🛑 SL: -2.5%\n"
             f"━━━━━━━━━━━━━━━\n"
             f"⏱️ Min kati ya trades: 90 dakika\n"
             f"📅 Max trades kwa siku: {MAX_TRADES_PER_DAY}\n"
