@@ -16,12 +16,12 @@ OKX_BASE = "https://www.okx.com"
 
 DRY_RUN = False
 LEVERAGE = 5
-FIRST_ENTRY_PCT = 0.10
-ADD_ENTRY_PCT = 0.10
+FIRST_ENTRY_PCT = 0.30
+ADD_ENTRY_PCT = 0.20
 ADD_THRESHOLD_PCT = 0.02
 OKX_FEE = 0.0005 * 2
 TP_LEVELS = [0.015, 0.02, 0.025, 0.03]
-SL_PCT = 0.025
+SL_PCT = 0.01
 MIN_WAIT_BETWEEN_TRADES = 90 * 60
 MAX_TRADES_PER_DAY = 15
 MIN_SCORE = 6
@@ -55,9 +55,7 @@ async def send_telegram(session, msg):
 def get_headers(method, path, body=""):
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     msg = ts + method.upper() + path + body
-    sig = base64.b64encode(
-        hmac.new(OKX_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
-    ).decode()
+    sig = base64.b64encode(hmac.new(OKX_SECRET.encode(), msg.encode(), hashlib.sha256).digest()).decode()
     return {
         "OK-ACCESS-KEY": OKX_API_KEY,
         "OK-ACCESS-SIGN": sig,
@@ -103,12 +101,7 @@ async def get_futures_balance(session):
 async def set_leverage(session, inst_id, pos_side):
     try:
         path = "/api/v5/account/set-leverage"
-        body = json.dumps({
-            "instId": inst_id,
-            "lever": str(LEVERAGE),
-            "mgnMode": "isolated",
-            "posSide": pos_side
-        })
+        body = json.dumps({"instId": inst_id, "lever": str(LEVERAGE), "mgnMode": "isolated", "posSide": pos_side})
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
             await r.json()
@@ -120,15 +113,7 @@ async def place_order(session, inst_id, side, pos_side, size):
         return {"ordId": f"sim_{int(time.time())}"}
     try:
         path = "/api/v5/trade/order"
-        body = json.dumps({
-            "instId": inst_id,
-            "tdMode": "isolated",
-            "side": side,
-            "posSide": pos_side,
-            "ordType": "market",
-            "sz": str(size),
-            "clOrdId": f"bot{int(time.time())}"
-        })
+        body = json.dumps({"instId": inst_id, "tdMode": "isolated", "side": side, "posSide": pos_side, "ordType": "market", "sz": str(size), "clOrdId": f"bot{int(time.time())}"})
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
             data = await r.json()
@@ -149,11 +134,7 @@ async def close_position(session, inst_id, pos_side):
         return True
     try:
         path = "/api/v5/trade/close-position"
-        body = json.dumps({
-            "instId": inst_id,
-            "mgnMode": "isolated",
-            "posSide": pos_side
-        })
+        body = json.dumps({"instId": inst_id, "mgnMode": "isolated", "posSide": pos_side})
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
             data = await r.json()
@@ -177,14 +158,7 @@ async def get_all_futures(session):
                 low24h = float(t.get("low24h", 0))
                 sod = float(t.get("sodUtc8", price))
                 change_24h = ((price - sod) / sod * 100) if sod > 0 else 0
-                result.append({
-                    "instId": inst_id,
-                    "price": price,
-                    "high24h": high24h,
-                    "low24h": low24h,
-                    "change_24h": change_24h,
-                    "vol_usd": vol_usd
-                })
+                result.append({"instId": inst_id, "price": price, "high24h": high24h, "low24h": low24h, "change_24h": change_24h, "vol_usd": vol_usd})
             return result
     except:
         return []
@@ -262,84 +236,42 @@ def near_key_level(highs, lows, price, signal):
 def analyze(opens, highs, lows, closes, volumes, high24h, low24h):
     if len(closes) < 210:
         return "WAIT", {}
-
     price = closes[-1]
     r = rsi(closes, 14)
     e50  = ema(closes, 50)
     e200 = ema(closes, 200)
-
     range_24h = high24h - low24h
     price_pos = (price - low24h) / range_24h * 100 if range_24h > 0 else 50
-
     vol_ok = False
     if len(volumes) >= 8:
         vol_ok = sum(volumes[-3:]) / 3 > sum(volumes[-8:-3]) / 5 * 1.3
-
     candle_body = abs(closes[-1] - opens[-1])
     candle_range = highs[-1] - lows[-1]
     strong_candle = (candle_body / candle_range > 0.45) if candle_range > 0 else False
-
     momentum = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
-
     consecutive_up = len(closes) >= 3 and all(closes[-i] > closes[-i-1] for i in range(1, 3))
     consecutive_down = len(closes) >= 3 and all(closes[-i] < closes[-i-1] for i in range(1, 3))
-
-    info = {
-        "rsi": r, "e50": e50, "e200": e200,
-        "price_pos": price_pos, "vol_ok": vol_ok,
-        "strong_candle": strong_candle, "momentum": momentum,
-        "high24h": high24h, "low24h": low24h, "price": price
-    }
-
+    info = {"rsi": r, "e50": e50, "e200": e200, "price_pos": price_pos, "vol_ok": vol_ok, "strong_candle": strong_candle, "momentum": momentum, "high24h": high24h, "low24h": low24h, "price": price}
     if r > 50 and e50 > e200:
-        score = sum([
-            r > 50,
-            e50 > e200,
-            price > e50,
-            price_pos < 55,
-            vol_ok,
-            strong_candle,
-            momentum > 0.15,
-            consecutive_up,
-        ])
+        score = sum([r > 50, e50 > e200, price > e50, price_pos < 55, vol_ok, strong_candle, momentum > 0.15, consecutive_up])
         info["score"] = score
         if score >= MIN_SCORE:
-            if is_fake_breakout(opens, highs, lows, closes, "LONG"):
-                return "WAIT", info
-            if near_key_level(highs, lows, price, "LONG"):
-                return "WAIT", info
+            if is_fake_breakout(opens, highs, lows, closes, "LONG"): return "WAIT", info
+            if near_key_level(highs, lows, price, "LONG"): return "WAIT", info
             return "LONG", info
-
     if r < 50 and e50 < e200:
-        score = sum([
-            r < 50,
-            e50 < e200,
-            price < e50,
-            price_pos > 45,
-            vol_ok,
-            strong_candle,
-            momentum < -0.15,
-            consecutive_down,
-        ])
+        score = sum([r < 50, e50 < e200, price < e50, price_pos > 45, vol_ok, strong_candle, momentum < -0.15, consecutive_down])
         info["score"] = score
         if score >= MIN_SCORE:
-            if is_fake_breakout(opens, highs, lows, closes, "SHORT"):
-                return "WAIT", info
-            if near_key_level(highs, lows, price, "SHORT"):
-                return "WAIT", info
+            if is_fake_breakout(opens, highs, lows, closes, "SHORT"): return "WAIT", info
+            if near_key_level(highs, lows, price, "SHORT"): return "WAIT", info
             return "SHORT", info
-
     return "WAIT", info
 
 async def scan_best_coin(session):
     tickers = await get_all_futures(session)
-    candidates = [
-        t for t in tickers
-        if t["vol_usd"] >= MIN_VOLUME_USD
-        and MIN_CHANGE_PCT <= abs(t["change_24h"]) <= MAX_CHANGE_PCT
-    ]
+    candidates = [t for t in tickers if t["vol_usd"] >= MIN_VOLUME_USD and MIN_CHANGE_PCT <= abs(t["change_24h"]) <= MAX_CHANGE_PCT]
     candidates.sort(key=lambda x: x["vol_usd"], reverse=True)
-
     best_candidates = []
     for coin in candidates[:40]:
         inst_id = coin["instId"]
@@ -355,17 +287,14 @@ async def scan_best_coin(session):
         log(f"✅ {inst_id} | {signal} | RSI:{info['rsi']:.1f} | Score:{score}/8")
         best_candidates.append((score, inst_id, signal, coin["price"], info))
         await asyncio.sleep(0.2)
-
     if not best_candidates:
         return None, "WAIT", 0, {}
-
     best_candidates.sort(key=lambda x: x[0], reverse=True)
     score, inst_id, signal, price, info = best_candidates[0]
     return inst_id, signal, price, info
 
 async def open_trade(session, inst_id, signal, price, info):
     global active_trade, last_trade_time, trades_today, last_trade_day
-
     margin_1 = current_margin * FIRST_ENTRY_PCT
     position_size = margin_1 * LEVERAGE
     fee_est = position_size * OKX_FEE
@@ -373,15 +302,12 @@ async def open_trade(session, inst_id, signal, price, info):
     size = max(round(position_size / (price * ct_val), 0), min_sz)
     pos_side = "long" if signal == "LONG" else "short"
     side = "buy" if signal == "LONG" else "sell"
-
     await set_leverage(session, inst_id, pos_side)
-
     if not DRY_RUN:
         result = await place_order(session, inst_id, side, pos_side, int(size))
         if not result:
             log("Order imeshindwa")
             return
-
     first_tp_pct = TP_LEVELS[0]
     if signal == "LONG":
         tp = round(price * (1 + first_tp_pct), 6)
@@ -397,34 +323,16 @@ async def open_trade(session, inst_id, signal, price, info):
         tp2 = round(price * (1 - TP_LEVELS[1]), 6)
         tp3 = round(price * (1 - TP_LEVELS[2]), 6)
         tp4 = round(price * (1 - TP_LEVELS[3]), 6)
-
-    active_trade = {
-        "inst_id": inst_id,
-        "signal": signal,
-        "pos_side": pos_side,
-        "entry_price": price,
-        "total_margin": margin_1,
-        "position_size": position_size,
-        "tp_price": tp,
-        "sl_price": sl,
-        "tp_idx": 0,
-        "entry_time": time.time(),
-        "added": False,
-        "closed": False,
-        "fee_est": fee_est
-    }
-
+    active_trade = {"inst_id": inst_id, "signal": signal, "pos_side": pos_side, "entry_price": price, "total_margin": margin_1, "position_size": position_size, "tp_price": tp, "sl_price": sl, "tp_idx": 0, "entry_time": time.time(), "added": False, "closed": False, "fee_est": fee_est}
     last_trade_time = time.time()
     today = datetime.now().strftime("%Y-%m-%d")
     if last_trade_day != today:
         trades_today = 0
         last_trade_day = today
     trades_today += 1
-
     coin_name = inst_id.replace("-SWAP", "")
     score = info.get("score", 0)
     mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-
     msg = (
         f"🎯 IMEINGIA TRADE!\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -438,16 +346,16 @@ async def open_trade(session, inst_id, signal, price, info):
         f"🎯 TP4: {tp4} (+{TP_LEVELS[3]*100:.1f}%)\n"
         f"🛑 SL: {sl} (-{SL_PCT*100:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📊 RSI: {info.get('rsi', 0):.1f}\n"
-        f"📈 EMA50: {info.get('e50', 0):.4f}\n"
-        f"📉 EMA200: {info.get('e200', 0):.4f}\n"
-        f"📍 Position 24h: {info.get('price_pos', 0):.0f}%\n"
+        f"📊 RSI: {info.get('rsi',0):.1f}\n"
+        f"📈 EMA50: {info.get('e50',0):.4f}\n"
+        f"📉 EMA200: {info.get('e200',0):.4f}\n"
+        f"📍 Position 24h: {info.get('price_pos',0):.0f}%\n"
         f"📦 Volume: {'✅' if info.get('vol_ok') else '❌'}\n"
         f"🕯️ Candle: {'✅' if info.get('strong_candle') else '❌'}\n"
-        f"⚡ Momentum: {info.get('momentum', 0):+.2f}%\n"
+        f"⚡ Momentum: {info.get('momentum',0):+.2f}%\n"
         f"🎯 Score: {score}/8\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💰 Margin: ${margin_1:.2f} (10%)\n"
+        f"💰 Margin: ${margin_1:.2f} (30% ya ${current_margin:.2f})\n"
         f"🔢 Leverage: {LEVERAGE}x\n"
         f"📅 Trades leo: {trades_today}/{MAX_TRADES_PER_DAY}\n"
         f"⚡ {mode}"
@@ -457,27 +365,21 @@ async def open_trade(session, inst_id, signal, price, info):
 
 async def monitor_trade(session):
     global active_trade, stats
-
     while True:
         try:
             if not active_trade or active_trade["closed"]:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
-
             trade = active_trade
             price = await get_price(session, trade["inst_id"])
             if not price:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
-
             coin_name = trade["inst_id"].replace("-SWAP", "")
-
             if trade["signal"] == "LONG":
                 change = (price - trade["entry_price"]) / trade["entry_price"]
             else:
                 change = (trade["entry_price"] - price) / trade["entry_price"]
-
-            # Ongeza position ikiendelea vizuri
             if not trade["added"] and change >= ADD_THRESHOLD_PCT:
                 margin_2 = current_margin * ADD_ENTRY_PCT
                 position_2 = margin_2 * LEVERAGE
@@ -491,42 +393,23 @@ async def monitor_trade(session):
                 trade["fee_est"] += position_2 * OKX_FEE
                 trade["added"] = True
                 mode2 = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-                await send_telegram(session,
-                    f"➕ IMEONGEZA!\n"
-                    f"📊 {coin_name}\n"
-                    f"💲 Bei: {price}\n"
-                    f"💰 +${margin_2:.2f} (10% zaidi)\n"
-                    f"📈 {change*100:+.2f}%\n"
-                    f"⚡ {mode2}"
-                )
-
-            tp_hit = (
-                (trade["signal"] == "LONG" and price >= trade["tp_price"]) or
-                (trade["signal"] == "SHORT" and price <= trade["tp_price"])
-            )
-            sl_hit = (
-                (trade["signal"] == "LONG" and price <= trade["sl_price"]) or
-                (trade["signal"] == "SHORT" and price >= trade["sl_price"])
-            )
-
-            # TP imefikiwa na bado kuna level nyingine — hamisha SL, subiri TP inayofuata
+                await send_telegram(session, f"➕ IMEONGEZA!\n📊 {coin_name}\n💲 Bei: {price}\n💰 +${margin_2:.2f} (20% zaidi)\n📈 {change*100:+.2f}%\n⚡ {mode2}")
+            tp_hit = ((trade["signal"] == "LONG" and price >= trade["tp_price"]) or (trade["signal"] == "SHORT" and price <= trade["tp_price"]))
+            sl_hit = ((trade["signal"] == "LONG" and price <= trade["sl_price"]) or (trade["signal"] == "SHORT" and price >= trade["sl_price"]))
             if tp_hit and trade["tp_idx"] < len(TP_LEVELS) - 1:
                 current_tp_pct = TP_LEVELS[trade["tp_idx"]]
                 next_idx = trade["tp_idx"] + 1
                 next_tp_pct = TP_LEVELS[next_idx]
                 entry = trade["entry_price"]
-
                 if trade["signal"] == "LONG":
                     new_tp = round(entry * (1 + next_tp_pct), 6)
                     new_sl = round(entry * (1 + current_tp_pct * 0.5), 6)
                 else:
                     new_tp = round(entry * (1 - next_tp_pct), 6)
                     new_sl = round(entry * (1 - current_tp_pct * 0.5), 6)
-
                 trade["tp_price"] = new_tp
                 trade["sl_price"] = new_sl
                 trade["tp_idx"] = next_idx
-
                 mode2 = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
                 await send_telegram(session,
                     f"📈 TP{next_idx} IMEFIKIWA!\n"
@@ -540,32 +423,26 @@ async def monitor_trade(session):
                 )
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
-
-            # TP4 au SL — funga trade
             if tp_hit or sl_hit:
                 if not DRY_RUN:
                     await close_position(session, trade["inst_id"], trade["pos_side"])
-
                 trade["closed"] = True
                 gross = change * trade["total_margin"] * LEVERAGE
                 fees = trade["fee_est"]
                 net = gross - fees
                 hold = (time.time() - trade["entry_time"]) / 60
                 tp_level_reached = TP_LEVELS[trade["tp_idx"]] * 100
-
                 if net > 0:
                     stats["wins"] += 1
                     emoji = f"💰 TAKE PROFIT! (+{tp_level_reached:.1f}%)"
                 else:
                     stats["losses"] += 1
                     emoji = "🛑 STOP LOSS!"
-
                 stats["pnl"] += net
                 stats["fees"] += fees
                 win_rate = (stats["wins"] / max(stats["wins"] + stats["losses"], 1)) * 100
                 balance = await get_futures_balance(session)
                 mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
-
                 msg = (
                     f"{emoji}\n"
                     f"━━━━━━━━━━━━━━━\n"
@@ -590,9 +467,7 @@ async def monitor_trade(session):
                 await send_telegram(session, msg)
                 active_trade = None
                 await check_margin_growth(session)
-
             await asyncio.sleep(MONITOR_INTERVAL)
-
         except Exception as e:
             log(f"Monitor error: {e}")
             await asyncio.sleep(MONITOR_INTERVAL)
@@ -604,66 +479,50 @@ async def check_margin_growth(session):
         old = current_margin
         current_margin = current_margin * (1 + MARGIN_GROWTH_PCT)
         last_double_at = balance
-        await send_telegram(session,
-            f"📈 MARGIN IMEONGEZWA!\n"
-            f"💰 Balance: ${balance:.4f}\n"
-            f"📊 ${old:.2f} → ${current_margin:.2f}\n"
-            f"🎯 Itaongezwa: ${balance * MARGIN_GROWTH_X:.2f}"
-        )
+        await send_telegram(session, f"📈 MARGIN IMEONGEZWA!\n💰 Balance: ${balance:.4f}\n📊 ${old:.2f} → ${current_margin:.2f}\n🎯 Itaongezwa: ${balance * MARGIN_GROWTH_X:.2f}")
 
 async def scanner_loop(session):
     global active_trade, last_trade_time, trades_today, last_trade_day
-
     await asyncio.sleep(5)
-
     while True:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             if last_trade_day != today:
                 trades_today = 0
                 last_trade_day = today
-
             if active_trade and not active_trade["closed"]:
                 log(f"⏳ Trade wazi: {active_trade['inst_id']}")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
-
             if trades_today >= MAX_TRADES_PER_DAY:
                 log(f"🛑 Limit ya leo: {trades_today}/{MAX_TRADES_PER_DAY}")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
-
             elapsed = time.time() - last_trade_time
             if last_trade_time > 0 and elapsed < MIN_WAIT_BETWEEN_TRADES:
                 wait_left = int((MIN_WAIT_BETWEEN_TRADES - elapsed) / 60)
                 log(f"⏳ Inasubiri dakika {wait_left}...")
                 await asyncio.sleep(60)
                 continue
-
             log("🔍 Inascan...")
             inst_id, signal, price, info = await scan_best_coin(session)
-
             if not inst_id:
                 log("Hakuna signal — inasubiri...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
-
             await open_trade(session, inst_id, signal, price, info)
             await asyncio.sleep(SCAN_INTERVAL)
-
         except Exception as e:
             log(f"Scanner error: {e}")
             await asyncio.sleep(30)
 
 async def main():
     global current_margin, last_double_at
-
     async with aiohttp.ClientSession() as session:
         await set_position_mode(session)
         balance = await get_futures_balance(session)
         current_margin = balance
         last_double_at = balance
-
         mode = "🔴 LIVE" if not DRY_RUN else "🧪 SIM"
         msg = (
             f"⚡ OKX FUTURES BOT!\n"
@@ -676,11 +535,11 @@ async def main():
             f"  TP2: +2.0% → SL inahamia\n"
             f"  TP3: +2.5% → SL inahamia\n"
             f"  TP4: +3.0% → EXIT\n"
-            f"🛑 SL: -2.5%\n"
+            f"🛑 SL: -{SL_PCT*100:.1f}%\n"
             f"━━━━━━━━━━━━━━━\n"
+            f"💰 Entry: {FIRST_ENTRY_PCT*100:.0f}% | Add: {ADD_ENTRY_PCT*100:.0f}%\n"
             f"⏱️ Min kati ya trades: 90 dakika\n"
             f"📅 Max trades kwa siku: {MAX_TRADES_PER_DAY}\n"
-            f"💰 Entry: 10% | Add: +10%\n"
             f"🧠 EMA 50/200 | RSI 14\n"
             f"🎯 Min Score: {MIN_SCORE}/8\n"
             f"⚡ Mode: {mode}"
