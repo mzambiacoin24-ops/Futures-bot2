@@ -104,20 +104,32 @@ async def place_order(session, inst_id, side, pos_side, size):
         return {"ordId": f"sim_{int(time.time())}"}
     try:
         path = "/api/v5/trade/order"
-        body = json.dumps({"instId": inst_id, "tdMode": "isolated", "side": side, "posSide": pos_side, "ordType": "market", "sz": str(size), "clOrdId": f"bot{int(time.time())}"})
+        sz_str = str(int(size)) if size >= 1 else str(round(float(size), 4))
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "isolated",
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "market",
+            "sz": sz_str,
+            "clOrdId": f"bot{int(time.time())}"
+        })
+        log(f"Placing order: {inst_id} {side} {pos_side} sz={sz_str}")
         headers = get_headers("POST", path, body)
         async with session.post(OKX_BASE + path, headers=headers, data=body) as r:
             data = await r.json()
+            log(f"Order response: code={data.get('code')} msg={data.get('msg')}")
             if data.get("code") == "0":
                 result = data.get("data", [{}])[0]
                 if result.get("sCode") == "0":
+                    log(f"Order OK: {result.get('ordId')}")
                     return result
-                log(f"Order failed: {result.get('sMsg')}")
+                log(f"Order sCode failed: {result.get('sCode')} | {result.get('sMsg')}")
             else:
-                log(f"Order error: {data.get('msg')}")
+                log(f"Order error: {data.get('msg')} | full: {data}")
             return None
     except Exception as e:
-        log(f"Order error: {e}")
+        log(f"Order exception: {e}")
         return None
 
 async def close_position(session, inst_id, pos_side):
@@ -320,9 +332,11 @@ async def open_trade(session, inst_id, signal, price, info):
     position_size = margin_1 * LEVERAGE
     fee_est = position_size * OKX_FEE
     min_sz, ct_val = await get_instrument_info(session, inst_id)
-    size = max(round(position_size / (price * ct_val), 0), min_sz)
-    if size < min_sz:
-        size = min_sz
+    # Hesabu contracts: position_size / (price * ct_val)
+    contracts = position_size / (price * ct_val)
+    # Rounddown hadi min_sz
+    size = max(round(contracts / min_sz) * min_sz, min_sz)
+    log(f"Size calc: position=${position_size:.2f} price={price} ctVal={ct_val} minSz={min_sz} contracts={contracts:.4f} size={size}")
     pos_side = "long" if signal == "LONG" else "short"
     side = "buy" if signal == "LONG" else "sell"
     await set_leverage(session, inst_id, pos_side)
