@@ -14,7 +14,7 @@ TELEGRAM_TOKEN = "8787267026:AAHjMfzdg9JwVxdCo6pnoiNq2o1xvU2pC30"
 TELEGRAM_CHAT_ID = "7010983039"
 OKX_BASE = "https://www.okx.com"
 
-COINS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+COINS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP", "XRP-USDT-SWAP"]
 DRY_RUN = False
 LEVERAGE = 5
 FIRST_ENTRY_PCT = 0.30
@@ -321,6 +321,8 @@ async def open_trade(session, inst_id, signal, price, info):
     fee_est = position_size * OKX_FEE
     min_sz, ct_val = await get_instrument_info(session, inst_id)
     size = max(round(position_size / (price * ct_val), 0), min_sz)
+    if size < min_sz:
+        size = min_sz
     pos_side = "long" if signal == "LONG" else "short"
     side = "buy" if signal == "LONG" else "sell"
     await set_leverage(session, inst_id, pos_side)
