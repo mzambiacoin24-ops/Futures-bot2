@@ -104,7 +104,7 @@ async def place_order(session, inst_id, side, pos_side, size):
         return {"ordId": f"sim_{int(time.time())}"}
     try:
         path = "/api/v5/trade/order"
-        sz_str = str(int(size)) if float(size) >= 1 and float(size) == int(float(size)) else str(float(size))
+        sz_str = str(size)
         body = json.dumps({
             "instId": inst_id,
             "tdMode": "isolated",
@@ -332,10 +332,9 @@ async def open_trade(session, inst_id, signal, price, info):
     position_size = margin_1 * LEVERAGE
     fee_est = position_size * OKX_FEE
     min_sz, ct_val = await get_instrument_info(session, inst_id)
-    contracts = position_size / (price * ct_val)
-    size = max(float(min_sz), round(contracts / float(min_sz)) * float(min_sz))
-    size = max(size, float(min_sz))
-    log(f"Size: position=${position_size:.2f} contracts={contracts:.4f} size={size} minSz={min_sz}")
+    # Lazima size iwe angalau min_sz
+    size = float(min_sz)
+    log(f"Size: minSz={min_sz} size={size}")
     pos_side = "long" if signal == "LONG" else "short"
     side = "buy" if signal == "LONG" else "sell"
     await set_leverage(session, inst_id, pos_side)
@@ -418,7 +417,7 @@ async def monitor_trade(session):
                 margin_2 = current_margin * ADD_ENTRY_PCT
                 position_2 = margin_2 * LEVERAGE
                 min_sz, ct_val = await get_instrument_info(session, trade["inst_id"])
-                size_2 = max(round(position_2 / (price * ct_val), 0), min_sz)
+                size_2 = float(min_sz)
                 if not DRY_RUN:
                     side = "buy" if trade["signal"] == "LONG" else "sell"
                     await place_order(session, trade["inst_id"], side, trade["pos_side"], int(size_2))
