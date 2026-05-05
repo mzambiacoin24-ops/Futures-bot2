@@ -104,7 +104,7 @@ async def place_order(session, inst_id, side, pos_side, size):
         return {"ordId": f"sim_{int(time.time())}"}
     try:
         path = "/api/v5/trade/order"
-        sz_str = str(int(size)) if size >= 1 else str(round(float(size), 4))
+        sz_str = str(int(size)) if float(size) >= 1 and float(size) == int(float(size)) else str(float(size))
         body = json.dumps({
             "instId": inst_id,
             "tdMode": "isolated",
@@ -332,11 +332,10 @@ async def open_trade(session, inst_id, signal, price, info):
     position_size = margin_1 * LEVERAGE
     fee_est = position_size * OKX_FEE
     min_sz, ct_val = await get_instrument_info(session, inst_id)
-    # Hesabu contracts: position_size / (price * ct_val)
     contracts = position_size / (price * ct_val)
-    # Rounddown hadi min_sz
-    size = max(round(contracts / min_sz) * min_sz, min_sz)
-    log(f"Size calc: position=${position_size:.2f} price={price} ctVal={ct_val} minSz={min_sz} contracts={contracts:.4f} size={size}")
+    size = max(float(min_sz), round(contracts / float(min_sz)) * float(min_sz))
+    size = max(size, float(min_sz))
+    log(f"Size: position=${position_size:.2f} contracts={contracts:.4f} size={size} minSz={min_sz}")
     pos_side = "long" if signal == "LONG" else "short"
     side = "buy" if signal == "LONG" else "sell"
     await set_leverage(session, inst_id, pos_side)
